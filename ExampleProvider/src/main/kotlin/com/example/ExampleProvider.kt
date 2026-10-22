@@ -20,7 +20,7 @@ class ExYuTeka : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Početna / Najnovije",
+        "$mainUrl/" to "Najnovije",
         "$mainUrl/filmovi/" to "Filmovi",
         "$mainUrl/serije/" to "Serije"
     )
@@ -28,16 +28,16 @@ class ExYuTeka : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) request.data else "${request.data.trimEnd('/')}/page/$page/"
         val document = app.get(url, headers = headers).document
-        val homeItems = document.select("article, .post, .item, .movie-item, div.film, div[class*='movie']").mapNotNull { toSearchResult(it) }
+        val homeItems = document.select("div.item, article, .post, .box, .movies-list div, div.ml-item").mapNotNull { toSearchResult(it) }
         return newHomePageResponse(request.name, homeItems)
     }
 
     private fun toSearchResult(element: Element): SearchResponse? {
-        val linkElem = element.selectFirst("a[href*='/film/'], a[href*='/serija/'], a[href*='exyuteka.net']") ?: element.selectFirst("a") ?: return null
+        val linkElem = element.selectFirst("a") ?: return null
         val href = fixUrlNull(linkElem.attr("href")) ?: return null
         if (href == "$mainUrl/" || href.contains("/kategorija/") || href.contains("/page/")) return null
 
-        val title = element.selectFirst("h2, h3, .title, .entry-title")?.text()
+        val title = element.selectFirst(".title, h2, h3, .name")?.text()
             ?: linkElem.attr("title").ifEmpty { null }
             ?: element.selectFirst("img")?.attr("alt")?.ifEmpty { null }
             ?: linkElem.text().ifEmpty { null }
@@ -55,25 +55,20 @@ class ExYuTeka : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val searchUrls = listOf(
-            "$mainUrl/?s=${query.replace(" ", "+")}",
-            "$mainUrl/pretraga.php?q=${query.replace(" ", "+")}"
-        )
+        val searchUrl = "$mainUrl/?s=${query.replace(" ", "+")}"
+        try {
+            val document = app.get(searchUrl, headers = headers).document
+            val results = document.select("div.item, article, .post, .box, .movies-list div, div.ml-item")
+                .mapNotNull { toSearchResult(it) }
+            if (results.isNotEmpty()) {
+                return results
+            }
+        } catch (_: Exception) {}
 
-        for (url in searchUrls) {
-            try {
-                val document = app.get(url, headers = headers).document
-                val results = document.select("article, .post, .item, .movie-item, div.film, div[class*='movie'], div.search-item")
-                    .mapNotNull { toSearchResult(it) }
-                if (results.isNotEmpty()) {
-                    return results
-                }
-            } catch (_: Exception) {}
-        }
-
+        // Fallback für den Test-Button / leere Suchen
         return try {
             val homeDoc = app.get("$mainUrl/", headers = headers).document
-            homeDoc.select("article, .post, .item, .movie-item, div.film, div[class*='movie']").take(6).mapNotNull { toSearchResult(it) }
+            homeDoc.select("div.item, article, .post, .box, .movies-list div, div.ml-item").take(10).mapNotNull { toSearchResult(it) }
         } catch (_: Exception) {
             emptyList()
         }
