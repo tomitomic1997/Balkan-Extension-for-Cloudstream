@@ -1,0 +1,8 @@
+{
+  "name": "Balkan Extension",
+  "description": "ExYuTeka Cloudstream Provider",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/tomitomic1997/Balkan-Extension-for-Cloudstream/builds/plugins.json"
+  ]
+}
