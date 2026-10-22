@@ -1,85 +1,106 @@
+@file:Suppress("DEPRECATION_ERROR", "DEPRECATION")
+
 package com.example
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.*
 
 class ExYuTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
     override var name = "ExYuTeka"
-    override val hasMainPage = true
-    override var lang = "sr"
+    override val hasMainPage = false
+    override var lang = "hr"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // 1. Suche abfragen
     override suspend fun search(query: String): List<SearchResponse> {
-        val searchUrl = "$mainUrl/pretraga.php?q=$query"
-        val document = app.get(searchUrl).document
+        val url = "$mainUrl/pretraga.php?q=$query"
+        val document = app.get(url).document
 
-        return document.select("a.card").mapNotNull { card ->
-            val title = card.selectFirst(".card-title")?.text()?.trim() ?: return@mapNotNull null
-            val href = fixUrl(card.attr("href"))
-            val poster = fixUrlNull(card.selectFirst(".card-poster img")?.attr("src"))
-            val year = card.selectFirst(".card-meta span")?.text()?.toIntOrNull()
+        return document.select("div.movie-item, div.item, a[href*='film.php'], a[href*='serija.php']").mapNotNull { element ->
+            val title = element.selectFirst("h3, h2, .title, .name")?.text() 
+                ?: element.attr("title").ifEmpty { null } 
+                ?: element.text().ifEmpty { null } 
+                ?: return@mapNotNull null
+            val href = fixUrl(element.attr("href").ifEmpty { element.selectFirst("a")?.attr("href") ?: return@mapNotNull null })
+            val posterUrl = fixUrlNull(element.selectFirst("img")?.attr("src"))
 
             newMovieSearchResponse(title, href, TvType.Movie) {
-                this.posterUrl = poster
-                this.year = year
+                this.posterUrl = posterUrl
             }
         }
     }
 
-    // 2. Filmseite laden
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
-        val title = document.selectFirst("h1.single-title")?.text()?.trim() ?: "Film"
-        val poster = fixUrlNull(document.selectFirst(".single-poster img")?.attr("src"))
-        val plot = document.selectFirst("p.single-desc")?.text()?.trim()
-
-        val year = document.select(".single-meta .meta-tag")
-            .firstOrNull { it.text().contains("20") }
-            ?.text()?.replace(Regex("[^0-9]"), "")?.toIntOrNull()
+        val title = document.selectFirst("h1, .movie-title, .title")?.text() ?: "ExYuTeka Video"
+        val posterUrl = fixUrlNull(document.selectFirst(".poster img, .movie-poster img, img[src*='poster']")?.attr("src"))
+        val plot = document.selectFirst(".plot, .description, .story, #description")?.text()
+        val year = document.selectFirst(".year, .release-date")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl = poster
+            this.posterUrl = posterUrl
             this.plot = plot
             this.year = year
         }
     }
 
-    // 3. MP4-Stream laden
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val movieDoc = app.get(data).document
-        val embedPath = movieDoc.selectFirst("iframe#toChange")?.attr("src")
-            ?: movieDoc.selectFirst(".embed-responsive iframe")?.attr("src")
-            ?: return false
+        val document = app.get(data).document
 
-        val embedUrl = fixUrl(embedPath)
-        val playerDoc = app.get(embedUrl, referer = data).document
+        var embedUrl = document.selectFirst("iframe[src*='srofilm'], iframe[src*='player'], iframe[src*='embed']")?.attr("src")
 
-        val rawVideoUrl = playerDoc.selectFirst("video#player")?.attr("data-src")
-            ?: playerDoc.selectFirst("video[data-src]")?.attr("data-src")
-            ?: return false
+        if (embedUrl.isNullOrEmpty()) {
+            val scripts = document.select("script").map { it.html() }
+            for (script in scripts) {
+                val match = Regex("""src=["'](https?://[^"']*srofilm[^"']*)["']""").find(script)
+                    ?: Regex("""["'](https?://[^"']*player[^"']*)["']""").find(script)
+                if (match != null) {
+                    embedUrl = match.groupValues[1]
+                    break
+                }
+            }
+        }
 
-        val videoUrl = rawVideoUrl.replace("&amp;", "&")
+        val targetUrl = if (!embedUrl.isNullOrEmpty()) fixUrl(embedUrl) else data
+        val playerDoc = app.get(targetUrl, referer = data).document
 
-        callback.invoke(
-            ExtractorLink(
-                source = name,
-                name = "$name HD",
-                url = videoUrl,
-                referer = embedUrl,
-                quality = Qualities.P1080.value,
-                isM3u8 = false
+        var videoUrl = playerDoc.selectFirst("video#player")?.attr("data-src")
+            ?: playerDoc.selectFirst("video source")?.attr("src")
+            ?: playerDoc.selectFirst("video")?.attr("src")
+
+        if (videoUrl.isNullOrEmpty()) {
+            val html = playerDoc.html()
+            val match = Regex("""https?://cdn\.dsplayer\.site[^\s"'<>]+""").find(html)
+                ?: Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(html)
+            if (match != null) {
+                videoUrl = match.value
+            }
+        }
+
+        if (!videoUrl.isNullOrEmpty()) {
+            val isM3u8Link = videoUrl.contains(".m3u8")
+            val linkType = if (isM3u8Link) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
+            callback.invoke(
+                newExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = videoUrl,
+                    type = linkType
+                ) {
+                    this.referer = data
+                    this.quality = Qualities.P1080.value
+                }
             )
-        )
+            return true
+        }
 
-        return true
+        return false
     }
 }
