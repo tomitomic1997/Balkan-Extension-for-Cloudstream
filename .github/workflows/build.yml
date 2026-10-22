@@ -36,6 +36,7 @@ jobs:
           git checkout -B builds
           find . -name "*.cs3" -exec cp -f {} . \; 2>/dev/null || true
           find . -name "plugins.json" -exec cp -f {} . \; 2>/dev/null || true
+          sed -i 's/\/master\//\/builds\//g' plugins.json 2>/dev/null || true
           git add -f repo.json plugins.json *.cs3 || true
           git commit -m "Build $GITHUB_SHA" || true
           git push -f origin builds
