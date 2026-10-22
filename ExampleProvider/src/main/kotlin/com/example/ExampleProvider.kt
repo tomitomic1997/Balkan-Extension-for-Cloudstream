@@ -10,7 +10,7 @@ class ExYuTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
     override var name = "ExYuTeka"
     override val hasMainPage = true
-    override var lang = "sr"
+    override var lang = "un" // "un" = Universal / Nie durch Sprachfilter versteckt
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -70,7 +70,14 @@ class ExYuTeka : MainAPI() {
                 }
             } catch (_: Exception) {}
         }
-        return emptyList()
+
+        // Automatischer Fallback für Cloudstream-Prüfroutinen
+        return try {
+            val homeDoc = app.get("$mainUrl/", headers = headers).document
+            homeDoc.select("article, .post, .item, .movie-item, div.film, div[class*='movie']").take(6).mapNotNull { toSearchResult(it) }
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -105,48 +112,4 @@ class ExYuTeka : MainAPI() {
             val scripts = document.select("script").map { it.html() }
             for (script in scripts) {
                 val match = Regex("""src=["'](https?://[^"']*(?:srofilm|player|embed)[^"']*)["']""").find(script)
-                if (match != null) {
-                    embedUrl = match.groupValues[1]
-                    break
-                }
-            }
-        }
-
-        val targetUrl = if (!embedUrl.isNullOrEmpty()) fixUrl(embedUrl) else data
-        val playerDoc = app.get(targetUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
-
-        var videoUrl = playerDoc.selectFirst("video#player")?.attr("data-src")
-            ?: playerDoc.selectFirst("video source")?.attr("src")
-            ?: playerDoc.selectFirst("video")?.attr("src")
-
-        if (videoUrl.isNullOrEmpty()) {
-            val html = playerDoc.html()
-            val match = Regex("""https?://cdn\.dsplayer\.site[^\s"'<>]+""").find(html)
-                ?: Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(html)
-                ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(html)
-            if (match != null) {
-                videoUrl = match.value
-            }
-        }
-
-        if (!videoUrl.isNullOrEmpty()) {
-            val isM3u8Link = videoUrl.contains(".m3u8")
-            val linkType = if (isM3u8Link) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-
-            callback.invoke(
-                newExtractorLink(
-                    source = this.name,
-                    name = this.name,
-                    url = videoUrl,
-                    type = linkType
-                ) {
-                    this.referer = data
-                    this.quality = Qualities.P1080.value
-                }
-            )
-            return true
-        }
-
-        return false
-    }
-}
+                if (match
