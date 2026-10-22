@@ -36,6 +36,8 @@ jobs:
           git checkout -B builds
           find . -name "*.cs3" -exec cp -f {} . \;
           find . -name "plugins.json" -exec cp -f {} . \;
-          git add -f --ignore-missing repo.json plugins.json *.cs3
+          git add -f repo.json || true
+          git add -f plugins.json || true
+          git add -f *.cs3 || true
           git commit -m "Build $GITHUB_SHA" || true
           git push -f origin builds
