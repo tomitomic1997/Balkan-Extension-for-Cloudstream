@@ -27,15 +27,13 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build plugins
-        run: ./gradlew makePlugins json -PcloudstreamVersion=pre-release
+        run: ./gradlew makePlugins -PcloudstreamVersion=pre-release
 
       - name: Push to builds
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git checkout -B builds
-          git add -f repo.json
-          git add -f plugins.json
-          git add -f *.cs3
+          git add -f --ignore-missing repo.json plugins.json *.cs3 || true
           git commit -m "Build $GITHUB_SHA" || true
           git push -f origin builds
