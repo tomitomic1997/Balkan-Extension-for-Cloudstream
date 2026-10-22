@@ -27,7 +27,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build plugins
-        run: ./gradlew makePlugins json
+        run: ./gradlew makePlugins json -PcloudstreamVersion=pre-release
 
       - name: Push to builds
         run: |
