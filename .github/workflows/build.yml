@@ -34,6 +34,8 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git checkout -B builds
-          git add -f --ignore-missing repo.json plugins.json *.cs3 || true
+          find . -name "*.cs3" -exec cp -f {} . \;
+          find . -name "plugins.json" -exec cp -f {} . \;
+          git add -f --ignore-missing repo.json plugins.json *.cs3
           git commit -m "Build $GITHUB_SHA" || true
           git push -f origin builds
