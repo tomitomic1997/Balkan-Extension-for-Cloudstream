@@ -140,7 +140,7 @@ class ExYuTeka : MainAPI() {
         }
     }
 
-    private fun addStreamLink(
+    private suspend fun addStreamLink(
         rawUrl: String,
         refererUrl: String,
         serverName: String,
@@ -182,15 +182,13 @@ class ExYuTeka : MainAPI() {
             val html = response.text
             val doc = response.document
 
-            // 1. Direkter Video-Tag
-            doc.select("video source, video").forEach { v ->
+            for (v in doc.select("video source, video")) {
                 val src = v.attr("src").ifEmpty { v.attr("data-src") }
                 if (src.isNotEmpty() && !src.startsWith("blob:")) {
                     if (addStreamLink(src, playerUrl, serverLabel, callback)) found = true
                 }
             }
 
-            // 2. JavaScript Regex für Video-Quellen
             val patterns = listOf(
                 Regex("""["'](https?://[^"']*\.mp4[^"']*)["']"""),
                 Regex("""["'](https?://[^"']*\.m3u8[^"']*)["']"""),
@@ -220,7 +218,6 @@ class ExYuTeka : MainAPI() {
         var success = false
         val document = app.get(data, headers = headers).document
 
-        // Alle Iframes auf der Seite einsammeln (z.B. /embed/srofilm.php?search=glo-svadba-2026)
         val iframes = document.select("iframe").mapNotNull {
             val src = it.attr("src").ifEmpty { it.attr("data-src") }
             if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
@@ -229,10 +226,8 @@ class ExYuTeka : MainAPI() {
         }
 
         for (embedUrl in iframes) {
-            // Such-Slug aus der Iframe-URL extrahieren (z. B. glo-svadba-2026)
             val searchSlug = Regex("""[?&]search=([^&]+)""").find(embedUrl)?.groupValues?.get(1)
 
-            // Falls dsplayer direkt über den Slug erreichbar ist
             if (!searchSlug.isNullOrEmpty()) {
                 val dsplayerVariants = listOf(
                     "https://dsplayer.site/embed2/video.php?slug=$searchSlug",
@@ -246,15 +241,12 @@ class ExYuTeka : MainAPI() {
                 }
             }
 
-            // Die srofilm.php-Seite selbst abrufen und alle 5 Server auslesen
             try {
                 val sroDoc = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
                 val sroHtml = sroDoc.html()
-
-                // Alle Server-Knöpfe, Links, Tabs und Iframes in srofilm.php finden
                 val serverCandidates = mutableSetOf<String>()
 
-                sroDoc.select("iframe, a, button, div.server, li.server, [data-src], [data-url], [data-embed]").forEach { elem ->
+                for (elem in sroDoc.select("iframe, a, button, div.server, li.server, [data-src], [data-url], [data-embed]")) {
                     val urlCandidate = elem.attr("src").ifEmpty {
                         elem.attr("data-src").ifEmpty {
                             elem.attr("data-url").ifEmpty {
@@ -269,7 +261,6 @@ class ExYuTeka : MainAPI() {
                     }
                 }
 
-                // Nach URLs in Skript-Tags suchen
                 val scriptUrls = Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s"'<>\\]+""").findAll(sroHtml)
                 for (match in scriptUrls) {
                     val raw = match.value.replace("\\/", "/")
@@ -278,17 +269,14 @@ class ExYuTeka : MainAPI() {
                     }
                 }
 
-                // Alle gefundenen Server-Links durchprobieren
                 var serverCounter = 1
                 for (candUrl in serverCandidates) {
-                    // Standard-Cloudstream Extractor (Vidhide, Streamtape, Filemoon etc.)
                     try {
                         if (loadExtractor(candUrl, embedUrl, subtitleCallback, callback)) {
                             success = true
                         }
                     } catch (_: Exception) {}
 
-                    // DSPlayer-Verarbeitung
                     if (candUrl.contains("dsplayer.site")) {
                         if (parseDsPlayer(candUrl, "Server $serverCounter", callback)) {
                             success = true
