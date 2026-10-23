@@ -2,6 +2,7 @@
 
 package com.example
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -21,24 +22,25 @@ class ExYuTeka : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Najnovije",
-        "$mainUrl/filmovi.php" to "Filmovi",
-        "$mainUrl/serije.php" to "Serije"
+        "$mainUrl/filmovi.php" to "Domaći Filmovi",
+        "$mainUrl/serije.php" to "Domaće Serije",
+        "$mainUrl/sinhronizovani.php" to "Sinhronizovani Filmovi"
     )
 
     private fun parseMoviesFromDoc(document: Document): List<SearchResponse> {
         val seenUrls = mutableSetOf<String>()
         val results = mutableListOf<SearchResponse>()
 
-        val elements = document.select("a:has(img), div:has(img) > a, article a, [class*='movie'] a, [class*='film'] a, [class*='card'] a")
+        val elements = document.select("a[href*='/film/'], a[href*='/serija/'], a[href*='/gledaj-online/'], a[href*='/ep/'], a:has(img)")
 
         for (link in elements) {
             val href = fixUrlNull(link.attr("href")) ?: continue
 
-            if (href == mainUrl || href == "$mainUrl/" || href.endsWith("index.php") || href.endsWith("#")) continue
+            if (href == mainUrl || href == "$mainUrl/" || href.endsWith(".php") || href.endsWith("#")) continue
             if (href.contains("login") || href.contains("register") || href.contains("kontakt")) continue
 
             val card = link.parent() ?: link
-            val img = link.selectFirst("img") ?: card.selectFirst("img") ?: continue
+            val img = link.selectFirst("img") ?: card.selectFirst("img") ?: card.parent()?.selectFirst("img") ?: continue
 
             val posterUrl = fixUrlNull(
                 img.attr("data-src").ifEmpty {
@@ -52,17 +54,17 @@ class ExYuTeka : MainAPI() {
 
             val rawTitle = link.attr("title").trim().ifEmpty { null }
                 ?: img.attr("alt").trim().ifEmpty { null }
-                ?: card.selectFirst("h1, h2, h3, h4, h5, .title, .name, [class*='title'], p, span")?.text()?.trim()?.ifEmpty { null }
+                ?: card.selectFirst("h1, h2, h3, h4, h5, .title, .name, [class*='title']")?.text()?.trim()?.ifEmpty { null }
                 ?: link.text().trim().ifEmpty { null }
-                ?: href.substringAfterLast("/").substringBefore(".php").substringBefore(".html").replace("-", " ").replace("_", " ").trim()
+                ?: href.substringAfterLast("/").replace("-", " ").trim()
 
             if (rawTitle.isEmpty()) continue
 
             val lowerTitle = rawTitle.lowercase()
-            if (lowerTitle in listOf("početna", "pocetna", "filmovi", "serije", "najnovije", "home", "pretraga")) continue
+            if (lowerTitle in listOf("početna", "pocetna", "filmovi", "serije", "najnovije", "home", "pretraga", "domaći filmovi", "domaće serije")) continue
 
             if (seenUrls.add(href)) {
-                val isSeries = href.contains("/serij", ignoreCase = true) || lowerTitle.startsWith("serija ")
+                val isSeries = href.contains("/serija/") || href.contains("/gledaj-online/")
                 val type = if (isSeries) TvType.TvSeries else TvType.Movie
 
                 results.add(
@@ -77,17 +79,9 @@ class ExYuTeka : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        var document = app.get(request.data, headers = headers).document
-        var items = parseMoviesFromDoc(document)
-
-        if (items.isEmpty() && request.data.endsWith(".php")) {
-            val altUrl = request.data.removeSuffix(".php") + "/"
-            try {
-                document = app.get(altUrl, headers = headers).document
-                items = parseMoviesFromDoc(document)
-            } catch (_: Exception) {}
-        }
-
+        val url = if (page <= 1) request.data else "${request.data}?strana=$page"
+        val document = app.get(url, headers = headers).document
+        val items = parseMoviesFromDoc(document)
         return newHomePageResponse(request.name, items)
     }
 
@@ -107,75 +101,91 @@ class ExYuTeka : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        return try {
-            val homeDoc = app.get("$mainUrl/", headers = headers).document
-            parseMoviesFromDoc(homeDoc).take(10)
-        } catch (_: Exception) {
-            emptyList()
-        }
+        return emptyList()
     }
 
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = headers).document
 
-        val title = document.selectFirst("h1, h2, .entry-title, .movie-title, .title")?.text()?.trim() ?: "ExYuTeka Video"
+        val title = document.selectFirst("h1, h2, .entry-title, .movie-title, .title")?.text()?.trim() ?: "ExYuTeka"
         val posterUrl = fixUrlNull(
-            document.selectFirst(".poster img, .entry-content img, img[class*='poster'], img")?.attr("data-src")
-                ?: document.selectFirst(".poster img, .entry-content img, img[class*='poster'], img")?.attr("src")
+            document.selectFirst(".poster img, .entry-content img, img[class*='poster'], img[src*='upload'], img[src*='poster'], img")?.attr("data-src")
+                ?: document.selectFirst(".poster img, .entry-content img, img[class*='poster'], img[src*='upload'], img[src*='poster'], img")?.attr("src")
         )
         val rawPlot = document.selectFirst(".plot, .description, .story, #description, .entry-content p, p")?.text()?.trim() ?: ""
-        val year = document.selectFirst(".year, .release-date, span[class*='year']")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
+        val year = Regex("""\b(19\d{2}|20\d{2})\b""").find(document.text())?.value?.toIntOrNull()
 
-        // Serien-Erkennung NUR, wenn die Adresse explizit "serij" enthält
-        val isExplicitSeries = url.contains("/serij", ignoreCase = true)
-        val episodeLinks = if (isExplicitSeries) {
-            document.select("a[href*='epizoda'], a[href*='ep-'], div.epizode a, ul.episodios a")
-                .filter { it.attr("href").isNotEmpty() && fixUrl(it.attr("href")) != url }
-        } else {
-            emptyList()
+        // Auf ExYuTeka nutzen Episoden das Format /ep/name-s01e01
+        val episodeElements = document.select("a[href*='/ep/'], a[href*='epizod']")
+            .filter {
+                val epHref = fixUrlNull(it.attr("href")) ?: ""
+                epHref.isNotEmpty() && epHref != url && !it.text().contains("Prethodna") && !it.text().contains("Sledeća")
+            }
+
+        val isSeriesPage = url.contains("/serija/") || url.contains("/gledaj-online/") || ( !url.contains("/ep/") && episodeElements.size > 1 )
+
+        // Diagnose für die erste Zeile der Beschreibung (sofort am TV lesbar)
+        val iframes = document.select("iframe").mapNotNull { it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null } }
+        val dataAttrs = document.select("[data-src], [data-url], [data-embed], [data-player], [data-video], [data-iframe], [onclick*='player'], [onclick*='Server'], [onclick*='plejer']")
+            .mapNotNull { el ->
+                el.attr("data-embed").ifEmpty {
+                    el.attr("data-url").ifEmpty {
+                        el.attr("data-player").ifEmpty {
+                            el.attr("data-video").ifEmpty {
+                                el.attr("data-iframe").ifEmpty {
+                                    el.attr("onclick").ifEmpty { el.attr("data-src") }
+                                }
+                            }
+                        }
+                    }
+                }.ifEmpty { null }
+            }.filter { !it.endsWith(".jpg") && !it.endsWith(".png") && !it.endsWith(".webp") }.take(4)
+
+        val diagHeader = buildString {
+            append("[DIAG] ")
+            if (isSeriesPage) {
+                append("Serie erkannt (${episodeElements.size} Folgen) | ")
+            } else {
+                append("Iframes: ${if (iframes.isEmpty()) "0" else iframes.joinToString()} | ")
+                append("Player-Daten: ${if (dataAttrs.isEmpty()) "0" else dataAttrs.joinToString()} | ")
+            }
+            append("\n\n")
+            append(rawPlot)
         }
 
-        // Diagnose-Zeile direkt auf dem TV-Bildschirm
-        val iframes = document.select("iframe").mapNotNull {
-            val src = it.attr("data-src").ifEmpty { it.attr("src") }
-            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("facebook")) fixUrl(src) else null
-        }
-        val buttons = document.select("a[href*='gledaj'], a[href*='watch'], a[href*='player'], [data-url], [data-embed]").mapNotNull {
-            val target = it.attr("data-embed").ifEmpty { it.attr("data-url").ifEmpty { it.attr("href") } }
-            if (target.isNotEmpty() && !target.startsWith("#") && !target.startsWith("javascript")) fixUrl(target) else null
-        }.take(3)
-
-        val debugPlot = buildString {
-            if (rawPlot.isNotEmpty()) append(rawPlot).append("\n\n")
-            append("--- [DIAGNOSE] ---\n")
-            append("Typ: ").append(if (episodeLinks.isNotEmpty()) "Serie" else "Film").append("\n")
-            append("URL: ").append(url).append("\n")
-            if (iframes.isNotEmpty()) append("Iframes: ").append(iframes.joinToString(", ")).append("\n")
-            if (buttons.isNotEmpty()) append("Player-Buttons: ").append(buttons.joinToString(", ")).append("\n")
-            if (iframes.isEmpty() && buttons.isEmpty()) append("Hinweis: Kein Iframe und kein Button direkt im HTML gefunden.\n")
-        }
-
-        if (episodeLinks.isNotEmpty()) {
-            val episodes = episodeLinks.mapIndexed { index, epElem ->
+        if (isSeriesPage && episodeElements.isNotEmpty()) {
+            val episodes = episodeElements.mapIndexed { index, epElem ->
                 val epHref = fixUrl(epElem.attr("href"))
-                val epName = epElem.text().trim().ifEmpty { "Epizoda ${index + 1}" }
-                val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull() ?: (index + 1)
+                val epText = epElem.text().trim()
+
+                // Staffel & Episode aus URL (z.B. -s01e02) oder Text auslesen
+                val seMatch = Regex("""[sS](\d+)[eE](\d+)""").find(epHref) ?: Regex("""[sS](\d+)[eE](\d+)""").find(epText)
+                val seasonNum = seMatch?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""[sS]ezona\s*(\d+)""").find(epText)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: 1
+                val episodeNum = seMatch?.groupValues?.get(2)?.toIntOrNull()
+                    ?: Regex("""[eE]pizoda\s*(\d+)|[eE](\d+)""").find(epText)?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }?.toIntOrNull()
+                    ?: (index + 1)
+
+                val cleanName = epText.ifEmpty { "Epizoda $episodeNum" }
+
                 newEpisode(epHref) {
-                    this.name = epName
-                    this.episode = epNum
+                    this.name = cleanName
+                    this.season = seasonNum
+                    this.episode = episodeNum
                 }
             }.distinctBy { it.data }
 
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = posterUrl
-                this.plot = debugPlot
+                this.plot = diagHeader
                 this.year = year
             }
         }
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = posterUrl
-            this.plot = debugPlot
+            this.plot = diagHeader
             this.year = year
         }
     }
@@ -191,7 +201,7 @@ class ExYuTeka : MainAPI() {
         // 1. Direkte Video-Tags
         doc.select("video#player, video, video source").forEach { v ->
             val vUrl = v.attr("data-src").ifEmpty { v.attr("src") }
-            if (vUrl.isNotEmpty()) {
+            if (vUrl.isNotEmpty() && !vUrl.startsWith("blob:")) {
                 val fullUrl = fixUrl(vUrl)
                 callback.invoke(
                     newExtractorLink(
@@ -208,15 +218,15 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // 2. Stream-URLs im HTML-Quelltext
+        // 2. Direkte .m3u8 / .mp4 Links im Quelltext
         val html = doc.html()
-        val regexPatterns = listOf(
+        val streamRegexes = listOf(
             Regex("""https?://cdn\.dsplayer\.site[^\s"'<>\\]+"""),
             Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*"""),
             Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*""")
         )
 
-        for (regex in regexPatterns) {
+        for (regex in streamRegexes) {
             for (match in regex.findAll(html)) {
                 val streamUrl = match.value.replace("\\/", "/")
                 callback.invoke(
@@ -245,58 +255,98 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         var success = false
         val document = app.get(data, headers = headers).document
+        val rawHtml = document.html()
 
-        // Direkt auf der Seite suchen
+        // 1. Direkt auf der Film-/Episodenseite nach Streams suchen
         if (extractStreams(document, data, subtitleCallback, callback)) {
             success = true
         }
 
-        // Alle Player-Links einsammeln (Iframes & Buttons)
-        val targets = mutableSetOf<String>()
+        val candidateUrls = mutableSetOf<String>()
 
+        // 2. Alle Iframes sammeln
         document.select("iframe").forEach { iframe ->
             val src = iframe.attr("data-src").ifEmpty { iframe.attr("src") }
-            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("facebook")) {
-                targets.add(fixUrl(src))
+            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("facebook") && !src.startsWith("about:")) {
+                candidateUrls.add(fixUrl(src))
             }
         }
 
-        document.select("a[href*='gledaj'], a[href*='watch'], a[href*='player'], [data-url], [data-embed]").forEach { elem ->
-            val target = elem.attr("data-embed").ifEmpty {
-                elem.attr("data-url").ifEmpty {
-                    elem.attr("data-src").ifEmpty { elem.attr("href") }
+        // 3. Alle Player-Buttons / Server-Umschalter auslesen
+        document.select("[data-embed], [data-url], [data-player], [data-video], [data-iframe], [data-src], [onclick]").forEach { elem ->
+            val attrs = listOf(
+                elem.attr("data-embed"),
+                elem.attr("data-url"),
+                elem.attr("data-player"),
+                elem.attr("data-video"),
+                elem.attr("data-iframe"),
+                elem.attr("data-src"),
+                elem.attr("onclick")
+            )
+            for (attr in attrs) {
+                if (attr.isEmpty()) continue
+                if (attr.startsWith("http") || attr.startsWith("//") || attr.startsWith("/embed") || attr.startsWith("/player")) {
+                    if (!attr.endsWith(".jpg") && !attr.endsWith(".png") && !attr.endsWith(".webp") && !attr.endsWith(".js")) {
+                        candidateUrls.add(fixUrl(attr))
+                    }
                 }
-            }
-            if (target.isNotEmpty() && !target.startsWith("#") && !target.startsWith("javascript")) {
-                val fullTarget = fixUrl(target)
-                if (fullTarget != data) {
-                    targets.add(fullTarget)
+                val urlInAttr = Regex("""(https?:)?//[^\s"'<>\\)]+""").find(attr)?.value
+                if (urlInAttr != null && !urlInAttr.endsWith(".jpg") && !urlInAttr.endsWith(".png")) {
+                    candidateUrls.add(fixUrl(urlInAttr))
                 }
             }
         }
 
-        // Gefundene URLs abfragen
-        for (url in targets) {
+        // 4. Base64-codierte Player-URLs (starten mit "aHR0c") im HTML entschlüsseln
+        val b64Regex = Regex("""aHR0c[A-Za-z0-9+/=]{10,}""")
+        for (match in b64Regex.findAll(rawHtml)) {
             try {
-                if (loadExtractor(url, data, subtitleCallback, callback)) {
+                val decoded = String(Base64.decode(match.value, Base64.DEFAULT)).trim()
+                if (decoded.startsWith("http")) {
+                    candidateUrls.add(decoded)
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 5. Alle externen Embed-URLs in <script>-Blöcken finden
+        val scriptText = document.select("script").joinToString("\n") { it.html() }
+        val scriptUrlRegex = Regex("""["']((?:https?:)?//[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^"'\s<>\\]+)["']""")
+        for (match in scriptUrlRegex.findAll(scriptText)) {
+            val foundUrl = fixUrl(match.groupValues[1].replace("\\/", "/"))
+            val lower = foundUrl.lowercase()
+            val isIgnored = lower.contains("exyuteka.net") && (lower.endsWith(".js") || lower.endsWith(".css") || lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".webp"))
+                || lower.contains("google") || lower.contains("facebook") || lower.contains("cloudflare") || lower.contains("jsdelivr") || lower.contains("jquery") || lower.contains("schema.org") || lower.contains("w3.org")
+            if (!isIgnored) {
+                candidateUrls.add(foundUrl)
+            }
+        }
+
+        // 6. Jeden gefundenen Player-Link testen
+        for (targetUrl in candidateUrls) {
+            if (targetUrl == data) continue
+
+            // Standard Cloudstream Extractor (OK.ru, Vidhide, Filemoon, Streamtape, Voe, etc.)
+            try {
+                if (loadExtractor(targetUrl, data, subtitleCallback, callback)) {
                     success = true
                 }
             } catch (_: Exception) {}
 
+            // Eigene Extraktion + verschachtelte Iframes prüfen
             try {
-                val targetDoc = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
-                if (extractStreams(targetDoc, url, subtitleCallback, callback)) {
+                val playerDoc = app.get(targetUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
+                if (extractStreams(playerDoc, targetUrl, subtitleCallback, callback)) {
                     success = true
                 }
 
-                targetDoc.select("iframe").forEach { nested ->
+                playerDoc.select("iframe").forEach { nested ->
                     val nestedSrc = nested.attr("data-src").ifEmpty { nested.attr("src") }
-                    if (nestedSrc.isNotEmpty()) {
+                    if (nestedSrc.isNotEmpty() && !nestedSrc.startsWith("about:")) {
                         val fullNested = fixUrl(nestedSrc)
-                        if (loadExtractor(fullNested, url, subtitleCallback, callback)) {
+                        if (loadExtractor(fullNested, targetUrl, subtitleCallback, callback)) {
                             success = true
                         }
-                        val nestedDoc = app.get(fullNested, headers = mapOf("User-Agent" to userAgent, "Referer" to url)).document
+                        val nestedDoc = app.get(fullNested, headers = mapOf("User-Agent" to userAgent, "Referer" to targetUrl)).document
                         if (extractStreams(nestedDoc, fullNested, subtitleCallback, callback)) {
                             success = true
                         }
