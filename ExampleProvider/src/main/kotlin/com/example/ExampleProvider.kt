@@ -23,9 +23,9 @@ class ExYuTeka : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/#trending-filmovi" to "Trending Filmovi",
         "$mainUrl/#trending-serije" to "Trending Serije",
+        "$mainUrl/nove-epizode.php" to "Nove Epizode",
         "$mainUrl/filmovi.php" to "Domaći Filmovi",
         "$mainUrl/serije.php" to "Domaće Serije",
-        "$mainUrl/nove-epizode.php" to "Nove Epizode",
         "$mainUrl/sinhronizovani.php" to "Sinhronizovani Filmovi",
         "$mainUrl/crtaci.php" to "Crtaći",
         "$mainUrl/rijaliti.php" to "Rijaliti TV",
@@ -34,22 +34,47 @@ class ExYuTeka : MainAPI() {
         "$mainUrl/korejske.php" to "Korejske Serije"
     )
 
-    private fun parseCardElement(link: Element): SearchResponse? {
-        val href = fixUrlNull(link.attr("href")) ?: return null
+    private fun parseCardElement(element: Element): SearchResponse? {
+        val targetLink = if (element.tagName() == "a") {
+            element
+        } else {
+            element.selectFirst("a[href*='/film/'], a[href*='/serija/'], a[href*='/gledaj-online/'], a[href*='/ep/'], a") ?: return null
+        }
+
+        val href = fixUrlNull(targetLink.attr("href")) ?: return null
         if (href == mainUrl || href == "$mainUrl/" || href.endsWith(".php") || href.endsWith("#")) return null
 
-        val img = link.selectFirst("img") ?: link.parent()?.selectFirst("img") ?: return null
-        val posterUrl = fixUrlNull(img.attr("data-src").ifEmpty { img.attr("src") }) ?: return null
-        if (posterUrl.contains("logo") || posterUrl.contains("placeholder")) return null
+        val img = element.selectFirst("img") ?: targetLink.selectFirst("img") ?: element.parent()?.selectFirst("img")
+        val posterUrl = fixUrlNull(
+            img?.attr("data-src")?.ifEmpty { null }
+                ?: img?.attr("data-lazy-src")?.ifEmpty { null }
+                ?: img?.attr("data-original")?.ifEmpty { null }
+                ?: img?.attr("src")?.ifEmpty { null }
+        )
+        if (posterUrl != null && posterUrl.contains("logo") && !posterUrl.contains("slika")) return null
 
-        val title = link.selectFirst(".card-title, h1, h2, h3, .title")?.text()?.trim()
-            ?: img.attr("alt").trim().ifEmpty { null }
-            ?: link.attr("title").trim().ifEmpty { null }
-            ?: return null
+        val seriesName = element.selectFirst(".ep-series")?.text()?.trim()
+        val epCode = element.selectFirst(".ep-code")?.text()?.trim()
 
-        if (title.lowercase() in listOf("početna", "filmovi", "serije", "najnovije")) return null
+        val title = when {
+            !seriesName.isNullOrEmpty() && !epCode.isNullOrEmpty() -> "$seriesName ($epCode)"
+            !seriesName.isNullOrEmpty() -> seriesName
+            else -> element.selectFirst(".card-title, .ep-title, .title, .name, h1, h2, h3, h4")?.text()?.trim()
+                ?: targetLink.selectFirst(".card-title, .ep-title, .title, .name")?.text()?.trim()
+                ?: img?.attr("alt")?.trim()?.ifEmpty { null }
+                ?: targetLink.attr("title").trim().ifEmpty { null }
+                ?: targetLink.text().trim().ifEmpty { null }
+                ?: return null
+        }
 
-        val isSeries = href.contains("/serija/") || href.contains("/gledaj-online/") || link.selectFirst(".serija-badge") != null
+        if (title.lowercase() in listOf("početna", "filmovi", "serije", "najnovije", "nove epizode")) return null
+
+        val isSeries = href.contains("/serija/") ||
+                href.contains("/gledaj-online/") ||
+                href.contains("/ep/") ||
+                element.selectFirst(".serija-badge") != null ||
+                element.hasClass("ep-row")
+
         val type = if (isSeries) TvType.TvSeries else TvType.Movie
 
         return newMovieSearchResponse(title, href, type) {
@@ -60,10 +85,13 @@ class ExYuTeka : MainAPI() {
     private fun parseCards(document: Document): List<SearchResponse> {
         val seenUrls = mutableSetOf<String>()
         val results = mutableListOf<SearchResponse>()
-        val cards = document.select("a.card, a[href*='/film/'], a[href*='/serija/'], a[href*='/gledaj-online/']")
+        val cards = document.select(
+            "a.card, div.card, a.ep-row, div.ep-row, a.episode-item, .card-grid > a, .card-grid > div, .ep-list > a, " +
+            "a[href*='/film/'], a[href*='/serija/'], a[href*='/gledaj-online/'], a[href*='/ep/']"
+        )
 
-        for (link in cards) {
-            val item = parseCardElement(link) ?: continue
+        for (elem in cards) {
+            val item = parseCardElement(elem) ?: continue
             if (seenUrls.add(item.url)) {
                 results.add(item)
             }
@@ -85,7 +113,7 @@ class ExYuTeka : MainAPI() {
             }
 
             if (section != null) {
-                for (link in section.select("a.card")) {
+                for (link in section.select("a.card, div.card")) {
                     parseCardElement(link)?.let { results.add(it) }
                 }
             } else {
@@ -169,6 +197,7 @@ class ExYuTeka : MainAPI() {
                                 this.name = "Epizoda $episodeNum"
                                 this.season = seasonNum
                                 this.episode = episodeNum
+                                this.posterUrl = posterUrl
                             }
                         )
                     }
@@ -191,6 +220,7 @@ class ExYuTeka : MainAPI() {
                             this.name = "Epizoda $eNum"
                             this.season = sNum
                             this.episode = eNum
+                            this.posterUrl = posterUrl
                         }
                     )
                 }
@@ -200,6 +230,7 @@ class ExYuTeka : MainAPI() {
                 val cleanEpisodes = episodes.distinctBy { it.data }
                 return newTvSeriesLoadResponse(title, targetUrl, TvType.TvSeries, cleanEpisodes) {
                     this.posterUrl = posterUrl
+                    this.backgroundPosterUrl = posterUrl
                     this.plot = plot
                     this.year = year
                 }
@@ -208,6 +239,7 @@ class ExYuTeka : MainAPI() {
 
         return newMovieLoadResponse(title, targetUrl, TvType.Movie, targetUrl) {
             this.posterUrl = posterUrl
+            this.backgroundPosterUrl = posterUrl
             this.plot = plot
             this.year = year
         }
