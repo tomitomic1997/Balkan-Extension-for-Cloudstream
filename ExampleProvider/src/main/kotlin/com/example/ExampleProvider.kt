@@ -261,7 +261,6 @@ class ExYuTeka : MainAPI() {
         val embedUrls = mutableSetOf<String>()
         val visitedUrls = mutableSetOf<String>()
 
-        // 1. Alle Iframes und Embed-Elemente der Seite einsammeln
         document.select("iframe").forEach {
             val src = it.attr("src").ifEmpty { it.attr("data-src") }
             if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
@@ -280,24 +279,25 @@ class ExYuTeka : MainAPI() {
             val searchSlug = Regex("""[?&]search=([^&]+)""").find(embedUrl)?.groupValues?.get(1)
             val cleanSlug = searchSlug?.removePrefix("rs-")?.removePrefix("glo-")
 
-            // DSPlayer-Direktvarianten ansteuern
+            // Alle Varianten von dsplayer (inklusive watch.php und .mp4) abdecken
             val candidateSlugs = listOfNotNull(searchSlug, cleanSlug).distinct()
             for (slug in candidateSlugs) {
                 val dsplayerVariants = listOf(
+                    "https://dsplayer.site/watch.php?v=$slug.mp4",
+                    "https://dsplayer.site/watch.php?v=$slug",
                     "https://dsplayer.site/embed2/video.php?slug=$slug",
                     "https://dsplayer.site/embed/video.php?slug=$slug",
                     "https://dsplayer.site/video.php?slug=$slug"
                 )
-                for ((idx, dsUrl) in dsplayerVariants.withIndex()) {
+                for (dsUrl in dsplayerVariants) {
                     if (visitedUrls.add(dsUrl)) {
-                        if (parseDsPlayer(dsUrl, "DSPlayer ${idx + 1}", callback)) {
+                        if (parseDsPlayer(dsUrl, "DSServer", callback)) {
                             success = true
                         }
                     }
                 }
             }
 
-            // Server-Dateien (sro1.php bis sro5.php und srofilm1.php bis srofilm5.php) vorbereiten
             val serverUrls = mutableSetOf(embedUrl)
             if (embedUrl.contains(Regex("""sro\d*\.php"""))) {
                 for (sNum in 1..5) {
@@ -317,7 +317,6 @@ class ExYuTeka : MainAPI() {
                     val sroDoc = sroResponse.document
                     val sroHtml = sroResponse.text
 
-                    // Direkte Video-Tags im Embed auslesen
                     for (v in sroDoc.select("video source, video")) {
                         val src = v.attr("src").ifEmpty { v.attr("data-src") }
                         if (src.isNotEmpty() && !src.startsWith("blob:")) {
@@ -327,7 +326,6 @@ class ExYuTeka : MainAPI() {
 
                     val potentialLinks = mutableSetOf<String>()
 
-                    // Attribute und onclick-Befehle aller Buttons und Links auslesen
                     sroDoc.select("iframe, a, button, div, li, [onclick], [data-src], [data-url], [data-embed]").forEach { el ->
                         val src = el.attr("src").ifEmpty {
                             el.attr("data-src").ifEmpty {
@@ -350,12 +348,10 @@ class ExYuTeka : MainAPI() {
                         }
                     }
 
-                    // URLs aus Skripten und Text parsen
                     Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"'<>\\]+""").findAll(sroHtml).forEach { m ->
                         potentialLinks.add(m.value.replace("\\/", "/"))
                     }
 
-                    var serverCount = 1
                     for (candUrl in potentialLinks) {
                         if (candUrl.endsWith(".js") || candUrl.endsWith(".css") || candUrl.endsWith(".png") ||
                             candUrl.endsWith(".jpg") || candUrl.endsWith(".svg") || candUrl.contains("googletag") ||
@@ -364,19 +360,16 @@ class ExYuTeka : MainAPI() {
 
                         if (candUrl.contains("dsplayer.site")) {
                             if (visitedUrls.add(candUrl)) {
-                                if (parseDsPlayer(candUrl, "DSPlayer", callback)) success = true
+                                if (parseDsPlayer(candUrl, "DSServer", callback)) success = true
                             }
                         } else if (candUrl.contains(".mp4") || candUrl.contains(".m3u8")) {
                             if (visitedUrls.add(candUrl)) {
-                                if (addStreamLink(candUrl, sUrl, "Server $serverCount", callback)) {
-                                    success = true
-                                    serverCount++
-                                }
+                                if (addStreamLink(candUrl, sUrl, "Server", callback)) success = true
                             }
                         } else {
                             val isHoster = listOf(
                                 "streamtape", "vidhide", "filemoon", "dood", "ds2play",
-                                "mixdrop", "voe.sx", "ok.ru", "upstream", "supervideo", "dropload"
+                                "mixdrop", "voe.sx", "ok.ru", "upstream", "supervideo", "dropload", "abys"
                             ).any { candUrl.contains(it) }
 
                             if (isHoster && visitedUrls.add(candUrl)) {
