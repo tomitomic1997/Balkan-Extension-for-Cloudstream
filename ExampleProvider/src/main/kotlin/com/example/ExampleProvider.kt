@@ -30,7 +30,6 @@ class ExYuTeka : MainAPI() {
         val seenUrls = mutableSetOf<String>()
         val results = mutableListOf<SearchResponse>()
 
-        // Findet alle Karten und Film-Links
         val cards = document.select("a.card, a[href*='/film/'], a[href*='/serija/'], a[href*='/gledaj-online/']")
 
         for (link in cards) {
@@ -102,11 +101,9 @@ class ExYuTeka : MainAPI() {
             Regex("""\b(19\d{2}|20\d{2})\b""").find(it)?.value?.toIntOrNull()
         }
 
-        // Glasklare Trennung: Ist /film/ in der URL, ist es IMMER ein Film!
         val isMovie = url.contains("/film/")
 
         if (!isMovie) {
-            // Nur bei Serien nach Episoden suchen
             val episodeElements = document.select("a[href*='/ep/'], a[href*='epizod'], div.episodes a, div.epizode a")
                 .filter { it.attr("href").isNotEmpty() && fixUrl(it.attr("href")) != url }
 
@@ -136,7 +133,6 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // Standard: Als Spielfilm laden
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = posterUrl
             this.plot = plot
@@ -144,60 +140,74 @@ class ExYuTeka : MainAPI() {
         }
     }
 
-    private suspend fun scanDocForVideos(
-        doc: Document,
-        pageUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
+    private fun addStreamLink(
+        rawUrl: String,
+        refererUrl: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val streamUrl = fixUrl(rawUrl.replace("\\/", "/").trim())
+        if (streamUrl.isEmpty() || streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") || streamUrl.endsWith(".js") || streamUrl.endsWith(".css")) {
+            return false
+        }
+
+        val isM3u8 = streamUrl.contains(".m3u8")
+        val isMp4 = streamUrl.contains(".mp4") || streamUrl.contains("cdn.dsplayer") || streamUrl.contains("/video/")
+
+        if (isM3u8 || isMp4) {
+            callback.invoke(
+                newExtractorLink(
+                    source = this.name,
+                    name = "${this.name} - $serverName",
+                    url = streamUrl,
+                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = refererUrl
+                    this.quality = Qualities.P1080.value
+                }
+            )
+            return true
+        }
+        return false
+    }
+
+    private suspend fun parseDsPlayer(
+        playerUrl: String,
+        serverLabel: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var found = false
+        try {
+            val response = app.get(playerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+            val html = response.text
+            val doc = response.document
 
-        // 1. Direkte Video-Tags
-        doc.select("video source, video").forEach { v ->
-            val src = v.attr("src").ifEmpty { v.attr("data-src") }
-            if (src.isNotEmpty() && !src.startsWith("blob:")) {
-                val fullUrl = fixUrl(src)
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = fullUrl,
-                        type = if (fullUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = pageUrl
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-                found = true
+            // 1. Direkter Video-Tag
+            doc.select("video source, video").forEach { v ->
+                val src = v.attr("src").ifEmpty { v.attr("data-src") }
+                if (src.isNotEmpty() && !src.startsWith("blob:")) {
+                    if (addStreamLink(src, playerUrl, serverLabel, callback)) found = true
+                }
             }
-        }
 
-        // 2. Stream-URLs im HTML/JavaScript-Text
-        val html = doc.html()
-        val regexList = listOf(
-            Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*"""),
-            Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*"""),
-            Regex("""https?://cdn\.dsplayer\.site[^\s"'<>\\]+""")
-        )
+            // 2. JavaScript Regex für Video-Quellen
+            val patterns = listOf(
+                Regex("""["'](https?://[^"']*\.mp4[^"']*)["']"""),
+                Regex("""["'](https?://[^"']*\.m3u8[^"']*)["']"""),
+                Regex("""["'](https?://cdn\.dsplayer\.site[^"']*)["']"""),
+                Regex("""file\s*:\s*["']([^"']+)["']"""),
+                Regex("""source\s*:\s*["']([^"']+)["']""")
+            )
 
-        for (regex in regexList) {
-            for (match in regex.findAll(html)) {
-                val streamUrl = match.value.replace("\\/", "/")
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = streamUrl,
-                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = pageUrl
-                        this.quality = Qualities.P1080.value
+            for (pattern in patterns) {
+                for (match in pattern.findAll(html)) {
+                    val candidate = match.groupValues[1]
+                    if (addStreamLink(candidate, playerUrl, serverLabel, callback)) {
+                        found = true
                     }
-                )
-                found = true
+                }
             }
-        }
-
+        } catch (_: Exception) {}
         return found
     }
 
@@ -207,10 +217,10 @@ class ExYuTeka : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var foundAny = false
+        var success = false
         val document = app.get(data, headers = headers).document
 
-        // Alle Iframes auf der Film- oder Episodenseite sammeln (z.B. /embed/srofilm.php?search=...)
+        // Alle Iframes auf der Seite einsammeln (z.B. /embed/srofilm.php?search=glo-svadba-2026)
         val iframes = document.select("iframe").mapNotNull {
             val src = it.attr("src").ifEmpty { it.attr("data-src") }
             if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
@@ -219,44 +229,76 @@ class ExYuTeka : MainAPI() {
         }
 
         for (embedUrl in iframes) {
-            // Erst Standard-Hoster (Streamtape, Filemoon etc.) probieren
-            try {
-                if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
-                    foundAny = true
+            // Such-Slug aus der Iframe-URL extrahieren (z. B. glo-svadba-2026)
+            val searchSlug = Regex("""[?&]search=([^&]+)""").find(embedUrl)?.groupValues?.get(1)
+
+            // Falls dsplayer direkt über den Slug erreichbar ist
+            if (!searchSlug.isNullOrEmpty()) {
+                val dsplayerVariants = listOf(
+                    "https://dsplayer.site/embed2/video.php?slug=$searchSlug",
+                    "https://dsplayer.site/embed/video.php?slug=$searchSlug",
+                    "https://dsplayer.site/video.php?slug=$searchSlug"
+                )
+                for ((idx, dsUrl) in dsplayerVariants.withIndex()) {
+                    if (parseDsPlayer(dsUrl, "DSPlayer ${idx + 1}", callback)) {
+                        success = true
+                    }
                 }
-            } catch (_: Exception) {}
+            }
 
-            // Den ExYuTeka-Embed-Player (/embed/srofilm.php) abrufen
+            // Die srofilm.php-Seite selbst abrufen und alle 5 Server auslesen
             try {
-                val embedDoc = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
+                val sroDoc = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
+                val sroHtml = sroDoc.html()
 
-                // Direkt nach Videos im Embed suchen
-                if (scanDocForVideos(embedDoc, embedUrl, subtitleCallback, callback)) {
-                    foundAny = true
+                // Alle Server-Knöpfe, Links, Tabs und Iframes in srofilm.php finden
+                val serverCandidates = mutableSetOf<String>()
+
+                sroDoc.select("iframe, a, button, div.server, li.server, [data-src], [data-url], [data-embed]").forEach { elem ->
+                    val urlCandidate = elem.attr("src").ifEmpty {
+                        elem.attr("data-src").ifEmpty {
+                            elem.attr("data-url").ifEmpty {
+                                elem.attr("data-embed").ifEmpty {
+                                    elem.attr("href")
+                                }
+                            }
+                        }
+                    }
+                    if (urlCandidate.isNotEmpty() && !urlCandidate.startsWith("#") && !urlCandidate.startsWith("javascript")) {
+                        serverCandidates.add(fixUrl(urlCandidate))
+                    }
                 }
 
-                // Falls der Embed-Player wiederum ein weiteres Iframe zu einem Hoster enthält
-                embedDoc.select("iframe").forEach { innerIframe ->
-                    val innerSrc = innerIframe.attr("src").ifEmpty { innerIframe.attr("data-src") }
-                    if (innerSrc.isNotEmpty()) {
-                        val fullInner = fixUrl(innerSrc)
-                        try {
-                            if (loadExtractor(fullInner, embedUrl, subtitleCallback, callback)) {
-                                foundAny = true
-                            }
-                        } catch (_: Exception) {}
+                // Nach URLs in Skript-Tags suchen
+                val scriptUrls = Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s"'<>\\]+""").findAll(sroHtml)
+                for (match in scriptUrls) {
+                    val raw = match.value.replace("\\/", "/")
+                    if (!raw.endsWith(".js") && !raw.endsWith(".css") && !raw.endsWith(".png") && !raw.endsWith(".jpg") && !raw.contains("google")) {
+                        serverCandidates.add(raw)
+                    }
+                }
 
-                        try {
-                            val innerDoc = app.get(fullInner, headers = mapOf("User-Agent" to userAgent, "Referer" to embedUrl)).document
-                            if (scanDocForVideos(innerDoc, fullInner, subtitleCallback, callback)) {
-                                foundAny = true
-                            }
-                        } catch (_: Exception) {}
+                // Alle gefundenen Server-Links durchprobieren
+                var serverCounter = 1
+                for (candUrl in serverCandidates) {
+                    // Standard-Cloudstream Extractor (Vidhide, Streamtape, Filemoon etc.)
+                    try {
+                        if (loadExtractor(candUrl, embedUrl, subtitleCallback, callback)) {
+                            success = true
+                        }
+                    } catch (_: Exception) {}
+
+                    // DSPlayer-Verarbeitung
+                    if (candUrl.contains("dsplayer.site")) {
+                        if (parseDsPlayer(candUrl, "Server $serverCounter", callback)) {
+                            success = true
+                            serverCounter++
+                        }
                     }
                 }
             } catch (_: Exception) {}
         }
 
-        return foundAny
+        return success
     }
 }
