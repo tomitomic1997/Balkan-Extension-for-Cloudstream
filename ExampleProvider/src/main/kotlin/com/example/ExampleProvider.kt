@@ -249,10 +249,16 @@ class ExYuTeka : MainAPI() {
         rawUrl: String,
         refererUrl: String,
         serverName: String,
+        emittedStreams: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val streamUrl = fixUrl(rawUrl.replace("\\/", "/").trim())
         if (streamUrl.isEmpty() || streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") || streamUrl.endsWith(".js") || streamUrl.endsWith(".css")) {
+            return false
+        }
+
+        // Verhindert doppelte Quellen mit identischer Stream-Adresse
+        if (!emittedStreams.add(streamUrl)) {
             return false
         }
 
@@ -279,6 +285,7 @@ class ExYuTeka : MainAPI() {
     private suspend fun parseDsPlayer(
         playerUrl: String,
         serverLabel: String,
+        emittedStreams: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var found = false
@@ -290,7 +297,7 @@ class ExYuTeka : MainAPI() {
             for (v in doc.select("video source, video")) {
                 val src = v.attr("src").ifEmpty { v.attr("data-src") }
                 if (src.isNotEmpty() && !src.startsWith("blob:")) {
-                    if (addStreamLink(src, playerUrl, serverLabel, callback)) found = true
+                    if (addStreamLink(src, playerUrl, serverLabel, emittedStreams, callback)) found = true
                 }
             }
 
@@ -305,7 +312,7 @@ class ExYuTeka : MainAPI() {
             for (pattern in patterns) {
                 for (match in pattern.findAll(html)) {
                     val candidate = match.groupValues[1]
-                    if (addStreamLink(candidate, playerUrl, serverLabel, callback)) {
+                    if (addStreamLink(candidate, playerUrl, serverLabel, emittedStreams, callback)) {
                         found = true
                     }
                 }
@@ -321,9 +328,11 @@ class ExYuTeka : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var success = false
+        val emittedStreams = mutableSetOf<String>()
+        val visitedUrls = mutableSetOf<String>()
+
         val document = app.get(data, headers = headers).document
         val embedUrls = mutableSetOf<String>()
-        val visitedUrls = mutableSetOf<String>()
 
         document.select("iframe").forEach {
             val src = it.attr("src").ifEmpty { it.attr("data-src") }
@@ -354,7 +363,7 @@ class ExYuTeka : MainAPI() {
                 )
                 for (dsUrl in dsplayerVariants) {
                     if (visitedUrls.add(dsUrl)) {
-                        if (parseDsPlayer(dsUrl, "DSServer", callback)) {
+                        if (parseDsPlayer(dsUrl, "DSServer", emittedStreams, callback)) {
                             success = true
                         }
                     }
@@ -383,7 +392,7 @@ class ExYuTeka : MainAPI() {
                     for (v in sroDoc.select("video source, video")) {
                         val src = v.attr("src").ifEmpty { v.attr("data-src") }
                         if (src.isNotEmpty() && !src.startsWith("blob:")) {
-                            if (addStreamLink(src, sUrl, "Direct", callback)) success = true
+                            if (addStreamLink(src, sUrl, "Direct", emittedStreams, callback)) success = true
                         }
                     }
 
@@ -423,12 +432,10 @@ class ExYuTeka : MainAPI() {
 
                         if (candUrl.contains("dsplayer.site")) {
                             if (visitedUrls.add(candUrl)) {
-                                if (parseDsPlayer(candUrl, "DSServer", callback)) success = true
+                                if (parseDsPlayer(candUrl, "DSServer", emittedStreams, callback)) success = true
                             }
                         } else if (candUrl.contains(".mp4") || candUrl.contains(".m3u8")) {
-                            if (visitedUrls.add(candUrl)) {
-                                if (addStreamLink(candUrl, sUrl, "Server", callback)) success = true
-                            }
+                            if (addStreamLink(candUrl, sUrl, "Server", emittedStreams, callback)) success = true
                         } else {
                             val isHoster = listOf(
                                 "streamtape", "vidhide", "filemoon", "dood", "ds2play",
