@@ -92,7 +92,6 @@ class ExYuTeka : MainAPI() {
         var targetUrl = url
         var document = app.get(targetUrl, headers = headers).document
 
-        // Falls direkt eine einzelne Folge aufgerufen wird: zur Hauptserie wechseln
         if (targetUrl.contains("/ep/")) {
             val parentSeriesHref = document.selectFirst("a[href*='/serija/'], a[href*='/gledaj-online/']")?.attr("href")
             if (!parentSeriesHref.isNullOrEmpty()) {
@@ -143,7 +142,6 @@ class ExYuTeka : MainAPI() {
                     }
                 }
             } else {
-                // Fallback für Folgenseiten oder alternative Layouts
                 val epLinks = document.select("a.episode-item, a.ep-row, a[href*='/ep/']")
                     .filter { it.attr("href").isNotEmpty() }
 
@@ -260,28 +258,29 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         var success = false
         val document = app.get(data, headers = headers).document
+        val embedUrls = mutableSetOf<String>()
+        val visitedUrls = mutableSetOf<String>()
 
-        // Alle Iframes auf der Seite einsammeln
-        val iframes = document.select("iframe").mapNotNull {
+        // 1. Alle Iframes und Embed-Elemente der Seite einsammeln
+        document.select("iframe").forEach {
             val src = it.attr("src").ifEmpty { it.attr("data-src") }
             if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
-                fixUrl(src)
-            } else null
-        }.toMutableList()
-
-        // Auch direkte Buttons oder Server-Links berücksichtigen
-        document.select("[data-src], [data-url], [data-embed]").forEach { elem ->
-            val u = elem.attr("data-src").ifEmpty { elem.attr("data-url").ifEmpty { elem.attr("data-embed") } }
-            if (u.contains("embed") || u.contains("php")) {
-                iframes.add(fixUrl(u))
+                embedUrls.add(fixUrl(src))
             }
         }
 
-        for (embedUrl in iframes.distinct()) {
+        document.select("[data-src], [data-url], [data-embed]").forEach { elem ->
+            val u = elem.attr("data-src").ifEmpty { elem.attr("data-url").ifEmpty { elem.attr("data-embed") } }
+            if (u.contains("embed") || u.contains("php") || u.contains("dsplayer")) {
+                embedUrls.add(fixUrl(u))
+            }
+        }
+
+        for (embedUrl in embedUrls) {
             val searchSlug = Regex("""[?&]search=([^&]+)""").find(embedUrl)?.groupValues?.get(1)
             val cleanSlug = searchSlug?.removePrefix("rs-")?.removePrefix("glo-")
 
-            // DSPlayer-Varianten mit beiden Slug-Formaten testen
+            // DSPlayer-Direktvarianten ansteuern
             val candidateSlugs = listOfNotNull(searchSlug, cleanSlug).distinct()
             for (slug in candidateSlugs) {
                 val dsplayerVariants = listOf(
@@ -290,59 +289,103 @@ class ExYuTeka : MainAPI() {
                     "https://dsplayer.site/video.php?slug=$slug"
                 )
                 for ((idx, dsUrl) in dsplayerVariants.withIndex()) {
-                    if (parseDsPlayer(dsUrl, "DSPlayer ${idx + 1}", callback)) {
-                        success = true
+                    if (visitedUrls.add(dsUrl)) {
+                        if (parseDsPlayer(dsUrl, "DSPlayer ${idx + 1}", callback)) {
+                            success = true
+                        }
                     }
                 }
             }
 
-            // Server 1 bis 5 (sro1.php bis sro5.php) durchgehen
-            val serverUrls = mutableListOf(embedUrl)
+            // Server-Dateien (sro1.php bis sro5.php und srofilm1.php bis srofilm5.php) vorbereiten
+            val serverUrls = mutableSetOf(embedUrl)
             if (embedUrl.contains(Regex("""sro\d*\.php"""))) {
                 for (sNum in 1..5) {
                     serverUrls.add(embedUrl.replace(Regex("""sro\d*\.php"""), "sro$sNum.php"))
                 }
+            } else if (embedUrl.contains("srofilm.php")) {
+                for (sNum in 1..5) {
+                    serverUrls.add(embedUrl.replace("srofilm.php", "sro$sNum.php"))
+                    serverUrls.add(embedUrl.replace("srofilm.php", "srofilm$sNum.php"))
+                }
             }
 
-            for ((sIndex, sUrl) in serverUrls.distinct().withIndex()) {
+            for (sUrl in serverUrls) {
+                if (!visitedUrls.add(sUrl)) continue
                 try {
-                    val sroDoc = app.get(sUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
-                    val sroHtml = sroDoc.html()
+                    val sroResponse = app.get(sUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
+                    val sroDoc = sroResponse.document
+                    val sroHtml = sroResponse.text
 
-                    // 1. Direkt im Embed-Dokument nach Streams suchen
+                    // Direkte Video-Tags im Embed auslesen
                     for (v in sroDoc.select("video source, video")) {
                         val src = v.attr("src").ifEmpty { v.attr("data-src") }
                         if (src.isNotEmpty() && !src.startsWith("blob:")) {
-                            if (addStreamLink(src, sUrl, "Server ${sIndex + 1}", callback)) success = true
+                            if (addStreamLink(src, sUrl, "Direct", callback)) success = true
                         }
                     }
 
-                    // 2. Eingebettete Hoster-Iframes in der Player-Seite auslesen
-                    for (nestedIframe in sroDoc.select("iframe")) {
-                        val nestedSrc = nestedIframe.attr("src").ifEmpty { nestedIframe.attr("data-src") }
-                        if (nestedSrc.isNotEmpty()) {
-                            val fullNested = fixUrl(nestedSrc)
-                            try {
-                                if (loadExtractor(fullNested, sUrl, subtitleCallback, callback)) {
-                                    success = true
-                                }
-                            } catch (_: Exception) {}
+                    val potentialLinks = mutableSetOf<String>()
 
-                            if (fullNested.contains("dsplayer.site")) {
-                                if (parseDsPlayer(fullNested, "Server ${sIndex + 1}", callback)) success = true
+                    // Attribute und onclick-Befehle aller Buttons und Links auslesen
+                    sroDoc.select("iframe, a, button, div, li, [onclick], [data-src], [data-url], [data-embed]").forEach { el ->
+                        val src = el.attr("src").ifEmpty {
+                            el.attr("data-src").ifEmpty {
+                                el.attr("data-url").ifEmpty {
+                                    el.attr("data-embed").ifEmpty {
+                                        el.attr("href")
+                                    }
+                                }
+                            }
+                        }
+                        if (src.isNotEmpty() && !src.startsWith("#") && !src.startsWith("javascript")) {
+                            potentialLinks.add(fixUrl(src))
+                        }
+
+                        val oc = el.attr("onclick")
+                        if (oc.isNotEmpty()) {
+                            Regex("""(?:https?:)?//[^\s'"\(\)]+""").findAll(oc).forEach { m ->
+                                potentialLinks.add(fixUrl(m.value))
                             }
                         }
                     }
 
-                    // 3. URLs in Skripten prüfen
-                    val scriptMatches = Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s"'<>\\]+""").findAll(sroHtml)
-                    for (m in scriptMatches) {
-                        val foundUrl = m.value.replace("\\/", "/")
-                        if (foundUrl.contains("dsplayer.site")) {
-                            if (parseDsPlayer(foundUrl, "Server ${sIndex + 1}", callback)) success = true
-                        }
-                        if (foundUrl.contains(".mp4") || foundUrl.contains(".m3u8")) {
-                            if (addStreamLink(foundUrl, sUrl, "Server ${sIndex + 1}", callback)) success = true
+                    // URLs aus Skripten und Text parsen
+                    Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"'<>\\]+""").findAll(sroHtml).forEach { m ->
+                        potentialLinks.add(m.value.replace("\\/", "/"))
+                    }
+
+                    var serverCount = 1
+                    for (candUrl in potentialLinks) {
+                        if (candUrl.endsWith(".js") || candUrl.endsWith(".css") || candUrl.endsWith(".png") ||
+                            candUrl.endsWith(".jpg") || candUrl.endsWith(".svg") || candUrl.contains("googletag") ||
+                            candUrl.contains("managertechnically") || candUrl.contains("al5sm.com")
+                        ) continue
+
+                        if (candUrl.contains("dsplayer.site")) {
+                            if (visitedUrls.add(candUrl)) {
+                                if (parseDsPlayer(candUrl, "DSPlayer", callback)) success = true
+                            }
+                        } else if (candUrl.contains(".mp4") || candUrl.contains(".m3u8")) {
+                            if (visitedUrls.add(candUrl)) {
+                                if (addStreamLink(candUrl, sUrl, "Server $serverCount", callback)) {
+                                    success = true
+                                    serverCount++
+                                }
+                            }
+                        } else {
+                            val isHoster = listOf(
+                                "streamtape", "vidhide", "filemoon", "dood", "ds2play",
+                                "mixdrop", "voe.sx", "ok.ru", "upstream", "supervideo", "dropload"
+                            ).any { candUrl.contains(it) }
+
+                            if (isHoster && visitedUrls.add(candUrl)) {
+                                try {
+                                    if (loadExtractor(candUrl, sUrl, subtitleCallback, callback)) {
+                                        success = true
+                                    }
+                                } catch (_: Exception) {}
+                            }
                         }
                     }
                 } catch (_: Exception) {}
