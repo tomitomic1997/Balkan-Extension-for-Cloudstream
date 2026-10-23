@@ -126,28 +126,31 @@ class ExYuTeka : MainAPI() {
         val rawPlot = document.selectFirst(".plot, .description, .story, #description, .entry-content p, p")?.text()?.trim() ?: ""
         val year = document.selectFirst(".year, .release-date, span[class*='year']")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
 
-        // Diagnose-Hilfe: Zeigt gefundene Iframes/Videos direkt im Beschreibungstext am TV an
-        val foundIframes = document.select("iframe").mapNotNull {
-            it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null }
-        }
-        val foundVideos = document.select("video, video source").mapNotNull {
-            it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null }
-        }
-        val debugInfo = buildString {
-            if (rawPlot.isNotEmpty()) append(rawPlot).append("\n\n")
-            append("[Diagnose] URL: ").append(url)
-            if (foundIframes.isNotEmpty()) append("\nIframes: ").append(foundIframes.joinToString(", "))
-            if (foundVideos.isNotEmpty()) append("\nVideos: ").append(foundVideos.joinToString(", "))
-            if (foundIframes.isEmpty() && foundVideos.isEmpty()) {
-                val watchLinks = document.select("a[href*='gledaj'], a[href*='watch'], a[href*='epizod'], a[href*='player'], a.btn").mapNotNull { it.attr("href").ifEmpty { null } }.take(5)
-                if (watchLinks.isNotEmpty()) append("\nButtons/Links: ").append(watchLinks.joinToString(", "))
-                else append("\nKeine direkten Iframes im HTML gefunden.")
+        // Prüfen, ob Episoden vorhanden sind (für Serien)
+        val episodeLinks = document.select("a[href*='epizod'], a[href*='ep-'], .episodes a, .episode a, ul.episodios li a, div.les-content a")
+            .filter { it.attr("href").isNotEmpty() && it.attr("href") != url }
+
+        if (episodeLinks.isNotEmpty()) {
+            val episodes = episodeLinks.mapIndexed { index, epElem ->
+                val epHref = fixUrl(epElem.attr("href"))
+                val epName = epElem.text().trim().ifEmpty { "Epizoda ${index + 1}" }
+                val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull() ?: (index + 1)
+                newEpisode(epHref) {
+                    this.name = epName
+                    this.episode = epNum
+                }
+            }.distinctBy { it.data }
+
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = posterUrl
+                this.plot = rawPlot
+                this.year = year
             }
         }
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = posterUrl
-            this.plot = debugInfo
+            this.plot = rawPlot
             this.year = year
         }
     }
@@ -160,7 +163,7 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         var found = false
 
-        // 1. Direkte <video> und <source> Elemente prüfen
+        // Direkte <video> und <source> Tags
         val videoElements = doc.select("video#player, video, video source")
         for (v in videoElements) {
             val vUrl = v.attr("data-src").ifEmpty { v.attr("src") }
@@ -182,7 +185,7 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // 2. Im gesamten HTML-Quelltext nach .m3u8, .mp4 oder dsplayer-Streams suchen
+        // HTML nach direkten Video-Stream-URLs absuchen
         val html = doc.html()
         val regexList = listOf(
             Regex("""https?://cdn\.dsplayer\.site[^\s"'<>\\]+"""),
@@ -220,17 +223,32 @@ class ExYuTeka : MainAPI() {
         var foundAny = false
         val document = app.get(data, headers = headers).document
 
-        // 1. Direkt auf der Hauptseite nach Streams suchen
+        // 1. Direkt auf der Seite prüfen
         if (extractFromDoc(document, data, subtitleCallback, callback)) {
             foundAny = true
         }
 
-        // 2. Alle Iframes aus HTML und <script>-Blöcken sammeln
-        val iframeUrls = mutableSetOf<String>()
+        // 2. Alle möglichen Player-Links sammeln (Iframes, Server-Tabs, Buttons wie "Gledaj")
+        val candidateUrls = mutableSetOf<String>()
+
         document.select("iframe").forEach { iframe ->
             val src = iframe.attr("data-src").ifEmpty { iframe.attr("src") }
-            if (src.isNotEmpty() && !src.contains("googletagmanager") && !src.contains("facebook")) {
-                iframeUrls.add(fixUrl(src))
+            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("facebook")) {
+                candidateUrls.add(fixUrl(src))
+            }
+        }
+
+        // Suche nach Server-Knöpfen, Watch-Buttons oder data-embed Attributen
+        document.select("[data-embed], [data-url], [data-src], a[href*='gledaj'], a[href*='watch'], a[href*='player'], a.btn").forEach { elem ->
+            val target = elem.attr("data-embed").ifEmpty {
+                elem.attr("data-url").ifEmpty {
+                    elem.attr("data-src").ifEmpty {
+                        elem.attr("href")
+                    }
+                }
+            }
+            if (target.isNotEmpty() && target != data && !target.startsWith("#") && !target.startsWith("javascript")) {
+                candidateUrls.add(fixUrl(target))
             }
         }
 
@@ -238,12 +256,12 @@ class ExYuTeka : MainAPI() {
         for (match in iframeRegex.findAll(document.html())) {
             val url = match.groupValues[1].replace("\\/", "/")
             if (!url.endsWith(".js") && !url.endsWith(".css") && !url.endsWith(".png") && !url.endsWith(".jpg")) {
-                iframeUrls.add(url)
+                candidateUrls.add(url)
             }
         }
 
-        // 3. Jedes gefundene Iframe über Cloudstream-Extractor UND eigenen Parser prüfen
-        for (embedUrl in iframeUrls) {
+        // 3. Alle gefundenen URLs über Cloudstream-Extractor und Dokument-Parser prüfen
+        for (embedUrl in candidateUrls) {
             try {
                 if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
                     foundAny = true
@@ -256,7 +274,7 @@ class ExYuTeka : MainAPI() {
                     foundAny = true
                 }
 
-                // Falls im Iframe noch ein weiteres Iframe steckt (verschachtelter Player)
+                // Verschachtelte Iframes innerhalb des Players prüfen
                 playerDoc.select("iframe").forEach { nested ->
                     val nestedSrc = nested.attr("data-src").ifEmpty { nested.attr("src") }
                     if (nestedSrc.isNotEmpty()) {
