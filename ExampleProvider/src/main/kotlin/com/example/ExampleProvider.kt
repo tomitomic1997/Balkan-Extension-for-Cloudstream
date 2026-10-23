@@ -62,7 +62,7 @@ class ExYuTeka : MainAPI() {
             if (lowerTitle in listOf("početna", "pocetna", "filmovi", "serije", "najnovije", "home", "pretraga")) continue
 
             if (seenUrls.add(href)) {
-                val isSeries = href.contains("serij", ignoreCase = true) || lowerTitle.contains("serija") || lowerTitle.contains("sezona")
+                val isSeries = href.contains("/serij", ignoreCase = true) || lowerTitle.startsWith("serija ")
                 val type = if (isSeries) TvType.TvSeries else TvType.Movie
 
                 results.add(
@@ -126,19 +126,29 @@ class ExYuTeka : MainAPI() {
         val rawPlot = document.selectFirst(".plot, .description, .story, #description, .entry-content p, p")?.text()?.trim() ?: ""
         val year = document.selectFirst(".year, .release-date, span[class*='year']")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
 
-        // Serien-Erkennung
-        val episodeLinks = document.select("a[href*='epizod'], a[href*='ep-'], .episodes a, .episode a, ul.episodios li a, div.les-content a")
-            .filter { it.attr("href").isNotEmpty() && it.attr("href") != url }
+        // Serien-Erkennung NUR, wenn die Adresse explizit "serij" enthält
+        val isExplicitSeries = url.contains("/serij", ignoreCase = true)
+        val episodeLinks = if (isExplicitSeries) {
+            document.select("a[href*='epizoda'], a[href*='ep-'], div.epizode a, ul.episodios a")
+                .filter { it.attr("href").isNotEmpty() && fixUrl(it.attr("href")) != url }
+        } else {
+            emptyList()
+        }
 
-        // Live-Diagnose für den TV-Bildschirm zusammenbauen
-        val iframes = document.select("iframe").mapNotNull { it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null } }
+        // Diagnose-Zeile direkt auf dem TV-Bildschirm
+        val iframes = document.select("iframe").mapNotNull {
+            val src = it.attr("data-src").ifEmpty { it.attr("src") }
+            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("facebook")) fixUrl(src) else null
+        }
         val buttons = document.select("a[href*='gledaj'], a[href*='watch'], a[href*='player'], [data-url], [data-embed]").mapNotNull {
-            it.attr("data-embed").ifEmpty { it.attr("data-url").ifEmpty { it.attr("href") } }.ifEmpty { null }
+            val target = it.attr("data-embed").ifEmpty { it.attr("data-url").ifEmpty { it.attr("href") } }
+            if (target.isNotEmpty() && !target.startsWith("#") && !target.startsWith("javascript")) fixUrl(target) else null
         }.take(3)
 
         val debugPlot = buildString {
             if (rawPlot.isNotEmpty()) append(rawPlot).append("\n\n")
             append("--- [DIAGNOSE] ---\n")
+            append("Typ: ").append(if (episodeLinks.isNotEmpty()) "Serie" else "Film").append("\n")
             append("URL: ").append(url).append("\n")
             if (iframes.isNotEmpty()) append("Iframes: ").append(iframes.joinToString(", ")).append("\n")
             if (buttons.isNotEmpty()) append("Player-Buttons: ").append(buttons.joinToString(", ")).append("\n")
@@ -178,7 +188,7 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         var found = false
 
-        // 1. Direkte HTML5 Video-Tags
+        // 1. Direkte Video-Tags
         doc.select("video#player, video, video source").forEach { v ->
             val vUrl = v.attr("data-src").ifEmpty { v.attr("src") }
             if (vUrl.isNotEmpty()) {
@@ -198,7 +208,7 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // 2. Skripte & HTML nach Direktlinks durchsuchen
+        // 2. Stream-URLs im HTML-Quelltext
         val html = doc.html()
         val regexPatterns = listOf(
             Regex("""https?://cdn\.dsplayer\.site[^\s"'<>\\]+"""),
@@ -236,12 +246,12 @@ class ExYuTeka : MainAPI() {
         var success = false
         val document = app.get(data, headers = headers).document
 
-        // 1. Prüfen, ob der Stream direkt auf der Seite liegt
+        // Direkt auf der Seite suchen
         if (extractStreams(document, data, subtitleCallback, callback)) {
             success = true
         }
 
-        // 2. Alle möglichen Player-Ziele sammeln (Iframes + Buttons/Server-Tabs)
+        // Alle Player-Links einsammeln (Iframes & Buttons)
         val targets = mutableSetOf<String>()
 
         document.select("iframe").forEach { iframe ->
@@ -257,12 +267,15 @@ class ExYuTeka : MainAPI() {
                     elem.attr("data-src").ifEmpty { elem.attr("href") }
                 }
             }
-            if (target.isNotEmpty() && target != data && !target.startsWith("#") && !target.startsWith("javascript")) {
-                targets.add(fixUrl(target))
+            if (target.isNotEmpty() && !target.startsWith("#") && !target.startsWith("javascript")) {
+                val fullTarget = fixUrl(target)
+                if (fullTarget != data) {
+                    targets.add(fullTarget)
+                }
             }
         }
 
-        // 3. Jedes Ziel abrufen und über Standard-Extractor + Stream-Parser auswerten
+        // Gefundene URLs abfragen
         for (url in targets) {
             try {
                 if (loadExtractor(url, data, subtitleCallback, callback)) {
@@ -276,7 +289,6 @@ class ExYuTeka : MainAPI() {
                     success = true
                 }
 
-                // Falls der Player in einem weiteren Iframe verschachtelt ist
                 targetDoc.select("iframe").forEach { nested ->
                     val nestedSrc = nested.attr("data-src").ifEmpty { nested.attr("src") }
                     if (nestedSrc.isNotEmpty()) {
