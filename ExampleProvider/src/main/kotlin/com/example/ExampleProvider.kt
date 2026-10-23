@@ -29,13 +29,11 @@ class ExYuTeka : MainAPI() {
         val seenUrls = mutableSetOf<String>()
         val results = mutableListOf<SearchResponse>()
 
-        // Sucht alle klickbaren Elemente, die ein Bild (Film-Cover) enthalten oder in einer Karte liegen
         val elements = document.select("a:has(img), div:has(img) > a, article a, [class*='movie'] a, [class*='film'] a, [class*='card'] a")
 
         for (link in elements) {
             val href = fixUrlNull(link.attr("href")) ?: continue
 
-            // Startseite und reine Menü-Links überspringen
             if (href == mainUrl || href == "$mainUrl/" || href.endsWith("index.php") || href.endsWith("#")) continue
             if (href.contains("login") || href.contains("register") || href.contains("kontakt")) continue
 
@@ -50,10 +48,8 @@ class ExYuTeka : MainAPI() {
                 }
             ) ?: continue
 
-            // Website-Logo und kleine Icons ignorieren
             if (posterUrl.contains("logo", ignoreCase = true) || posterUrl.contains("icon", ignoreCase = true)) continue
 
-            // Filmtitel aus allen gängigen Feldern oder aus der URL ableiten
             val rawTitle = link.attr("title").trim().ifEmpty { null }
                 ?: img.attr("alt").trim().ifEmpty { null }
                 ?: card.selectFirst("h1, h2, h3, h4, h5, .title, .name, [class*='title'], p, span")?.text()?.trim()?.ifEmpty { null }
@@ -62,7 +58,6 @@ class ExYuTeka : MainAPI() {
 
             if (rawTitle.isEmpty()) continue
 
-            // Menü-Begriffe wie Početna, Filmovi, Serije explizit herausfiltern
             val lowerTitle = rawTitle.lowercase()
             if (lowerTitle in listOf("početna", "pocetna", "filmovi", "serije", "najnovije", "home", "pretraga")) continue
 
@@ -85,19 +80,12 @@ class ExYuTeka : MainAPI() {
         var document = app.get(request.data, headers = headers).document
         var items = parseMoviesFromDoc(document)
 
-        // Falls die Unterseite ohne .php heißt (z. B. /filmovi/ statt /filmovi.php)
         if (items.isEmpty() && request.data.endsWith(".php")) {
             val altUrl = request.data.removeSuffix(".php") + "/"
             try {
                 document = app.get(altUrl, headers = headers).document
                 items = parseMoviesFromDoc(document)
             } catch (_: Exception) {}
-        }
-
-        // Diagnose-Karte anzeigen, falls die Seite Filme per JavaScript versteckt
-        if (items.isEmpty() && request.name == "Najnovije") {
-            val debugItem = newMovieSearchResponse("Diagnose-Info (Hier klicken)", "$mainUrl/#debug", TvType.Movie)
-            return newHomePageResponse(request.name, listOf(debugItem))
         }
 
         return newHomePageResponse(request.name, items)
@@ -128,15 +116,6 @@ class ExYuTeka : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // Wenn auf die Diagnose-Karte geklickt wird, zeige den HTML-Aufbau in der Beschreibung an
-        if (url.endsWith("#debug")) {
-            val doc = app.get(mainUrl, headers = headers).document
-            val bodySnippet = doc.body()?.html()?.take(1500) ?: "Kein HTML-Body gefunden"
-            return newMovieLoadResponse("HTML-Diagnose von ExYuTeka", url, TvType.Movie, url) {
-                this.plot = bodySnippet
-            }
-        }
-
         val document = app.get(url, headers = headers).document
 
         val title = document.selectFirst("h1, h2, .entry-title, .movie-title, .title")?.text()?.trim() ?: "ExYuTeka Video"
@@ -144,14 +123,92 @@ class ExYuTeka : MainAPI() {
             document.selectFirst(".poster img, .entry-content img, img[class*='poster'], img")?.attr("data-src")
                 ?: document.selectFirst(".poster img, .entry-content img, img[class*='poster'], img")?.attr("src")
         )
-        val plot = document.selectFirst(".plot, .description, .story, #description, .entry-content p, p")?.text()?.trim()
+        val rawPlot = document.selectFirst(".plot, .description, .story, #description, .entry-content p, p")?.text()?.trim() ?: ""
         val year = document.selectFirst(".year, .release-date, span[class*='year']")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
+
+        // Diagnose-Hilfe: Zeigt gefundene Iframes/Videos direkt im Beschreibungstext am TV an
+        val foundIframes = document.select("iframe").mapNotNull {
+            it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null }
+        }
+        val foundVideos = document.select("video, video source").mapNotNull {
+            it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null }
+        }
+        val debugInfo = buildString {
+            if (rawPlot.isNotEmpty()) append(rawPlot).append("\n\n")
+            append("[Diagnose] URL: ").append(url)
+            if (foundIframes.isNotEmpty()) append("\nIframes: ").append(foundIframes.joinToString(", "))
+            if (foundVideos.isNotEmpty()) append("\nVideos: ").append(foundVideos.joinToString(", "))
+            if (foundIframes.isEmpty() && foundVideos.isEmpty()) {
+                val watchLinks = document.select("a[href*='gledaj'], a[href*='watch'], a[href*='epizod'], a[href*='player'], a.btn").mapNotNull { it.attr("href").ifEmpty { null } }.take(5)
+                if (watchLinks.isNotEmpty()) append("\nButtons/Links: ").append(watchLinks.joinToString(", "))
+                else append("\nKeine direkten Iframes im HTML gefunden.")
+            }
+        }
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = posterUrl
-            this.plot = plot
+            this.plot = debugInfo
             this.year = year
         }
+    }
+
+    private suspend fun extractFromDoc(
+        doc: Document,
+        refererUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var found = false
+
+        // 1. Direkte <video> und <source> Elemente prüfen
+        val videoElements = doc.select("video#player, video, video source")
+        for (v in videoElements) {
+            val vUrl = v.attr("data-src").ifEmpty { v.attr("src") }
+            if (vUrl.isNotEmpty()) {
+                val fullVideoUrl = fixUrl(vUrl)
+                val isM3u8 = fullVideoUrl.contains(".m3u8")
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = this.name,
+                        url = fullVideoUrl,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = refererUrl
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+                found = true
+            }
+        }
+
+        // 2. Im gesamten HTML-Quelltext nach .m3u8, .mp4 oder dsplayer-Streams suchen
+        val html = doc.html()
+        val regexList = listOf(
+            Regex("""https?://cdn\.dsplayer\.site[^\s"'<>\\]+"""),
+            Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*"""),
+            Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*""")
+        )
+        for (regex in regexList) {
+            for (match in regex.findAll(html)) {
+                val streamUrl = match.value.replace("\\/", "/")
+                val isM3u8 = streamUrl.contains(".m3u8")
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = this.name,
+                        url = streamUrl,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = refererUrl
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+                found = true
+            }
+        }
+
+        return found
     }
 
     override suspend fun loadLinks(
@@ -160,58 +217,62 @@ class ExYuTeka : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        var foundAny = false
         val document = app.get(data, headers = headers).document
 
-        var embedUrl = document.selectFirst("iframe[src*='srofilm'], iframe[src*='player'], iframe[src*='embed'], iframe[data-src], iframe")?.let {
-            it.attr("data-src").ifEmpty { it.attr("src") }
+        // 1. Direkt auf der Hauptseite nach Streams suchen
+        if (extractFromDoc(document, data, subtitleCallback, callback)) {
+            foundAny = true
         }
 
-        if (embedUrl.isNullOrEmpty()) {
-            val scripts = document.select("script").map { it.html() }
-            for (script in scripts) {
-                val match = Regex("""src=["'](https?://[^"']*(?:srofilm|player|embed)[^"']*)["']""").find(script)
-                if (match != null) {
-                    embedUrl = match.groupValues[1]
-                    break
-                }
+        // 2. Alle Iframes aus HTML und <script>-Blöcken sammeln
+        val iframeUrls = mutableSetOf<String>()
+        document.select("iframe").forEach { iframe ->
+            val src = iframe.attr("data-src").ifEmpty { iframe.attr("src") }
+            if (src.isNotEmpty() && !src.contains("googletagmanager") && !src.contains("facebook")) {
+                iframeUrls.add(fixUrl(src))
             }
         }
 
-        val targetUrl = if (!embedUrl.isNullOrEmpty()) fixUrl(embedUrl) else data
-        val playerDoc = app.get(targetUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
-
-        var videoUrl = playerDoc.selectFirst("video#player")?.attr("data-src")
-            ?: playerDoc.selectFirst("video source")?.attr("src")
-            ?: playerDoc.selectFirst("video")?.attr("src")
-
-        if (videoUrl.isNullOrEmpty()) {
-            val html = playerDoc.html()
-            val match = Regex("""https?://cdn\.dsplayer\.site[^\s"'<>]+""").find(html)
-                ?: Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(html)
-                ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(html)
-            if (match != null) {
-                videoUrl = match.value
+        val iframeRegex = Regex("""(?:src|file|embed_url)\s*[:=]\s*["'](https?://[^"']+)["']""")
+        for (match in iframeRegex.findAll(document.html())) {
+            val url = match.groupValues[1].replace("\\/", "/")
+            if (!url.endsWith(".js") && !url.endsWith(".css") && !url.endsWith(".png") && !url.endsWith(".jpg")) {
+                iframeUrls.add(url)
             }
         }
 
-        if (!videoUrl.isNullOrEmpty()) {
-            val isM3u8Link = videoUrl.contains(".m3u8")
-            val linkType = if (isM3u8Link) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-
-            callback.invoke(
-                newExtractorLink(
-                    source = this.name,
-                    name = this.name,
-                    url = videoUrl,
-                    type = linkType
-                ) {
-                    this.referer = data
-                    this.quality = Qualities.P1080.value
+        // 3. Jedes gefundene Iframe über Cloudstream-Extractor UND eigenen Parser prüfen
+        for (embedUrl in iframeUrls) {
+            try {
+                if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
+                    foundAny = true
                 }
-            )
-            return true
+            } catch (_: Exception) {}
+
+            try {
+                val playerDoc = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
+                if (extractFromDoc(playerDoc, embedUrl, subtitleCallback, callback)) {
+                    foundAny = true
+                }
+
+                // Falls im Iframe noch ein weiteres Iframe steckt (verschachtelter Player)
+                playerDoc.select("iframe").forEach { nested ->
+                    val nestedSrc = nested.attr("data-src").ifEmpty { nested.attr("src") }
+                    if (nestedSrc.isNotEmpty()) {
+                        val fullNested = fixUrl(nestedSrc)
+                        if (loadExtractor(fullNested, embedUrl, subtitleCallback, callback)) {
+                            foundAny = true
+                        }
+                        val nestedDoc = app.get(fullNested, headers = mapOf("User-Agent" to userAgent, "Referer" to embedUrl)).document
+                        if (extractFromDoc(nestedDoc, fullNested, subtitleCallback, callback)) {
+                            foundAny = true
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
         }
 
-        return false
+        return foundAny
     }
 }
