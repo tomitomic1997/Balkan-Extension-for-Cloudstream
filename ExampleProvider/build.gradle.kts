@@ -1,4 +1,4 @@
-version = 2
+version = 3
 
 cloudstream {
     description = "ExYuTeka 🇷🇸 - Ex-Yu filmovi i serije"
