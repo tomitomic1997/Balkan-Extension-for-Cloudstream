@@ -126,9 +126,24 @@ class ExYuTeka : MainAPI() {
         val rawPlot = document.selectFirst(".plot, .description, .story, #description, .entry-content p, p")?.text()?.trim() ?: ""
         val year = document.selectFirst(".year, .release-date, span[class*='year']")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
 
-        // Prüfen, ob Episoden vorhanden sind (für Serien)
+        // Serien-Erkennung
         val episodeLinks = document.select("a[href*='epizod'], a[href*='ep-'], .episodes a, .episode a, ul.episodios li a, div.les-content a")
             .filter { it.attr("href").isNotEmpty() && it.attr("href") != url }
+
+        // Live-Diagnose für den TV-Bildschirm zusammenbauen
+        val iframes = document.select("iframe").mapNotNull { it.attr("data-src").ifEmpty { it.attr("src") }.ifEmpty { null } }
+        val buttons = document.select("a[href*='gledaj'], a[href*='watch'], a[href*='player'], [data-url], [data-embed]").mapNotNull {
+            it.attr("data-embed").ifEmpty { it.attr("data-url").ifEmpty { it.attr("href") } }.ifEmpty { null }
+        }.take(3)
+
+        val debugPlot = buildString {
+            if (rawPlot.isNotEmpty()) append(rawPlot).append("\n\n")
+            append("--- [DIAGNOSE] ---\n")
+            append("URL: ").append(url).append("\n")
+            if (iframes.isNotEmpty()) append("Iframes: ").append(iframes.joinToString(", ")).append("\n")
+            if (buttons.isNotEmpty()) append("Player-Buttons: ").append(buttons.joinToString(", ")).append("\n")
+            if (iframes.isEmpty() && buttons.isEmpty()) append("Hinweis: Kein Iframe und kein Button direkt im HTML gefunden.\n")
+        }
 
         if (episodeLinks.isNotEmpty()) {
             val episodes = episodeLinks.mapIndexed { index, epElem ->
@@ -143,19 +158,19 @@ class ExYuTeka : MainAPI() {
 
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = posterUrl
-                this.plot = rawPlot
+                this.plot = debugPlot
                 this.year = year
             }
         }
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = posterUrl
-            this.plot = rawPlot
+            this.plot = debugPlot
             this.year = year
         }
     }
 
-    private suspend fun extractFromDoc(
+    private suspend fun extractStreams(
         doc: Document,
         refererUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -163,19 +178,17 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         var found = false
 
-        // Direkte <video> und <source> Tags
-        val videoElements = doc.select("video#player, video, video source")
-        for (v in videoElements) {
+        // 1. Direkte HTML5 Video-Tags
+        doc.select("video#player, video, video source").forEach { v ->
             val vUrl = v.attr("data-src").ifEmpty { v.attr("src") }
             if (vUrl.isNotEmpty()) {
-                val fullVideoUrl = fixUrl(vUrl)
-                val isM3u8 = fullVideoUrl.contains(".m3u8")
+                val fullUrl = fixUrl(vUrl)
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
                         name = this.name,
-                        url = fullVideoUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        url = fullUrl,
+                        type = if (fullUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = refererUrl
                         this.quality = Qualities.P1080.value
@@ -185,23 +198,23 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // HTML nach direkten Video-Stream-URLs absuchen
+        // 2. Skripte & HTML nach Direktlinks durchsuchen
         val html = doc.html()
-        val regexList = listOf(
+        val regexPatterns = listOf(
             Regex("""https?://cdn\.dsplayer\.site[^\s"'<>\\]+"""),
             Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*"""),
             Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*""")
         )
-        for (regex in regexList) {
+
+        for (regex in regexPatterns) {
             for (match in regex.findAll(html)) {
                 val streamUrl = match.value.replace("\\/", "/")
-                val isM3u8 = streamUrl.contains(".m3u8")
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
                         name = this.name,
                         url = streamUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = refererUrl
                         this.quality = Qualities.P1080.value
@@ -220,77 +233,66 @@ class ExYuTeka : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var foundAny = false
+        var success = false
         val document = app.get(data, headers = headers).document
 
-        // 1. Direkt auf der Seite prüfen
-        if (extractFromDoc(document, data, subtitleCallback, callback)) {
-            foundAny = true
+        // 1. Prüfen, ob der Stream direkt auf der Seite liegt
+        if (extractStreams(document, data, subtitleCallback, callback)) {
+            success = true
         }
 
-        // 2. Alle möglichen Player-Links sammeln (Iframes, Server-Tabs, Buttons wie "Gledaj")
-        val candidateUrls = mutableSetOf<String>()
+        // 2. Alle möglichen Player-Ziele sammeln (Iframes + Buttons/Server-Tabs)
+        val targets = mutableSetOf<String>()
 
         document.select("iframe").forEach { iframe ->
             val src = iframe.attr("data-src").ifEmpty { iframe.attr("src") }
             if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("facebook")) {
-                candidateUrls.add(fixUrl(src))
+                targets.add(fixUrl(src))
             }
         }
 
-        // Suche nach Server-Knöpfen, Watch-Buttons oder data-embed Attributen
-        document.select("[data-embed], [data-url], [data-src], a[href*='gledaj'], a[href*='watch'], a[href*='player'], a.btn").forEach { elem ->
+        document.select("a[href*='gledaj'], a[href*='watch'], a[href*='player'], [data-url], [data-embed]").forEach { elem ->
             val target = elem.attr("data-embed").ifEmpty {
                 elem.attr("data-url").ifEmpty {
-                    elem.attr("data-src").ifEmpty {
-                        elem.attr("href")
-                    }
+                    elem.attr("data-src").ifEmpty { elem.attr("href") }
                 }
             }
             if (target.isNotEmpty() && target != data && !target.startsWith("#") && !target.startsWith("javascript")) {
-                candidateUrls.add(fixUrl(target))
+                targets.add(fixUrl(target))
             }
         }
 
-        val iframeRegex = Regex("""(?:src|file|embed_url)\s*[:=]\s*["'](https?://[^"']+)["']""")
-        for (match in iframeRegex.findAll(document.html())) {
-            val url = match.groupValues[1].replace("\\/", "/")
-            if (!url.endsWith(".js") && !url.endsWith(".css") && !url.endsWith(".png") && !url.endsWith(".jpg")) {
-                candidateUrls.add(url)
-            }
-        }
-
-        // 3. Alle gefundenen URLs über Cloudstream-Extractor und Dokument-Parser prüfen
-        for (embedUrl in candidateUrls) {
+        // 3. Jedes Ziel abrufen und über Standard-Extractor + Stream-Parser auswerten
+        for (url in targets) {
             try {
-                if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
-                    foundAny = true
+                if (loadExtractor(url, data, subtitleCallback, callback)) {
+                    success = true
                 }
             } catch (_: Exception) {}
 
             try {
-                val playerDoc = app.get(embedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
-                if (extractFromDoc(playerDoc, embedUrl, subtitleCallback, callback)) {
-                    foundAny = true
+                val targetDoc = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to data)).document
+                if (extractStreams(targetDoc, url, subtitleCallback, callback)) {
+                    success = true
                 }
 
-                // Verschachtelte Iframes innerhalb des Players prüfen
-                playerDoc.select("iframe").forEach { nested ->
+                // Falls der Player in einem weiteren Iframe verschachtelt ist
+                targetDoc.select("iframe").forEach { nested ->
                     val nestedSrc = nested.attr("data-src").ifEmpty { nested.attr("src") }
                     if (nestedSrc.isNotEmpty()) {
                         val fullNested = fixUrl(nestedSrc)
-                        if (loadExtractor(fullNested, embedUrl, subtitleCallback, callback)) {
-                            foundAny = true
+                        if (loadExtractor(fullNested, url, subtitleCallback, callback)) {
+                            success = true
                         }
-                        val nestedDoc = app.get(fullNested, headers = mapOf("User-Agent" to userAgent, "Referer" to embedUrl)).document
-                        if (extractFromDoc(nestedDoc, fullNested, subtitleCallback, callback)) {
-                            foundAny = true
+                        val nestedDoc = app.get(fullNested, headers = mapOf("User-Agent" to userAgent, "Referer" to url)).document
+                        if (extractStreams(nestedDoc, fullNested, subtitleCallback, callback)) {
+                            success = true
                         }
                     }
                 }
             } catch (_: Exception) {}
         }
 
-        return foundAny
+        return success
     }
 }
