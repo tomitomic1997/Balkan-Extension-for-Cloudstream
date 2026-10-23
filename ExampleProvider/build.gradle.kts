@@ -1,11 +1,12 @@
-version = 1
+version = 2
 
 cloudstream {
-    description = "ExYuTeka 🇷🇸 - Ex-Yu filmovi i serije"
+    name = "ExYuTeka"
+    description = "ExYuTeka - Filmovi i serije sa Balkana"
     authors = listOf("tomitomic1997")
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
-    language = "sr"
+    language = "all"
     iconUrl = "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png"
 }
