@@ -5,6 +5,7 @@ package com.example
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
 class ExYuTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
@@ -20,53 +21,85 @@ class ExYuTeka : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Najnovije",
+        "$mainUrl/#trending-filmovi" to "Trending Filmovi",
+        "$mainUrl/#trending-serije" to "Trending Serije",
         "$mainUrl/filmovi.php" to "Domaći Filmovi",
         "$mainUrl/serije.php" to "Domaće Serije",
-        "$mainUrl/sinhronizovani.php" to "Sinhronizovani Filmovi"
+        "$mainUrl/nove-epizode.php" to "Nove Epizode",
+        "$mainUrl/sinhronizovani.php" to "Sinhronizovani Filmovi",
+        "$mainUrl/crtaci.php" to "Crtaći",
+        "$mainUrl/rijaliti.php" to "Rijaliti TV",
+        "$mainUrl/dokumentarne.php" to "Dokumentarne Emisije",
+        "$mainUrl/latino.php" to "Latino Serije",
+        "$mainUrl/korejske.php" to "Korejske Serije"
     )
+
+    private fun parseCardElement(link: Element): SearchResponse? {
+        val href = fixUrlNull(link.attr("href")) ?: return null
+        if (href == mainUrl || href == "$mainUrl/" || href.endsWith(".php") || href.endsWith("#")) return null
+
+        val img = link.selectFirst("img") ?: link.parent()?.selectFirst("img") ?: return null
+        val posterUrl = fixUrlNull(img.attr("data-src").ifEmpty { img.attr("src") }) ?: return null
+        if (posterUrl.contains("logo") || posterUrl.contains("placeholder")) return null
+
+        val title = link.selectFirst(".card-title, h1, h2, h3, .title")?.text()?.trim()
+            ?: img.attr("alt").trim().ifEmpty { null }
+            ?: link.attr("title").trim().ifEmpty { null }
+            ?: return null
+
+        if (title.lowercase() in listOf("početna", "filmovi", "serije", "najnovije")) return null
+
+        val isSeries = href.contains("/serija/") || href.contains("/gledaj-online/") || link.selectFirst(".serija-badge") != null
+        val type = if (isSeries) TvType.TvSeries else TvType.Movie
+
+        return newMovieSearchResponse(title, href, type) {
+            this.posterUrl = posterUrl
+        }
+    }
 
     private fun parseCards(document: Document): List<SearchResponse> {
         val seenUrls = mutableSetOf<String>()
         val results = mutableListOf<SearchResponse>()
-
         val cards = document.select("a.card, a[href*='/film/'], a[href*='/serija/'], a[href*='/gledaj-online/']")
 
         for (link in cards) {
-            val href = fixUrlNull(link.attr("href")) ?: continue
-            if (href == mainUrl || href == "$mainUrl/" || href.endsWith(".php") || href.endsWith("#")) continue
-
-            val img = link.selectFirst("img") ?: link.parent()?.selectFirst("img") ?: continue
-            val posterUrl = fixUrlNull(img.attr("data-src").ifEmpty { img.attr("src") }) ?: continue
-            if (posterUrl.contains("logo") || posterUrl.contains("placeholder")) continue
-
-            val title = link.selectFirst(".card-title, h1, h2, h3, .title")?.text()?.trim()
-                ?: img.attr("alt").trim().ifEmpty { null }
-                ?: link.attr("title").trim().ifEmpty { null }
-                ?: continue
-
-            if (title.lowercase() in listOf("početna", "filmovi", "serije", "najnovije")) continue
-
-            if (seenUrls.add(href)) {
-                val isSeries = href.contains("/serija/") || href.contains("/gledaj-online/")
-                val type = if (isSeries) TvType.TvSeries else TvType.Movie
-
-                results.add(
-                    newMovieSearchResponse(title, href, type) {
-                        this.posterUrl = posterUrl
-                    }
-                )
+            val item = parseCardElement(link) ?: continue
+            if (seenUrls.add(item.url)) {
+                results.add(item)
             }
         }
-
         return results
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) request.data else "${request.data}?strana=$page"
+        val reqData = request.data
+
+        if (reqData.startsWith("$mainUrl/#trending-")) {
+            val document = app.get(mainUrl, headers = headers).document
+            val results = mutableListOf<SearchResponse>()
+            val isSeriesTrending = reqData.endsWith("serije")
+
+            val targetHeader = if (isSeriesTrending) "Trending Serije" else "Trending Filmovi"
+            val section = document.select("section.section").firstOrNull { sec ->
+                sec.selectFirst(".section-title")?.text()?.contains(targetHeader, ignoreCase = true) == true
+            }
+
+            if (section != null) {
+                for (link in section.select("a.card")) {
+                    parseCardElement(link)?.let { results.add(it) }
+                }
+            } else {
+                results.addAll(parseCards(document))
+            }
+            return newHomePageResponse(request.name, results, hasNext = false)
+        }
+
+        val url = if (page <= 1) reqData else "$reqData?strana=$page"
         val document = app.get(url, headers = headers).document
         val items = parseCards(document)
-        return newHomePageResponse(request.name, items)
+        val hasNext = items.isNotEmpty() && document.select("a[href*='strana=${page + 1}']").isNotEmpty()
+
+        return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -84,7 +117,6 @@ class ExYuTeka : MainAPI() {
                 }
             } catch (_: Exception) {}
         }
-
         return emptyList()
     }
 
@@ -279,7 +311,6 @@ class ExYuTeka : MainAPI() {
             val searchSlug = Regex("""[?&]search=([^&]+)""").find(embedUrl)?.groupValues?.get(1)
             val cleanSlug = searchSlug?.removePrefix("rs-")?.removePrefix("glo-")
 
-            // Alle Varianten von dsplayer (inklusive watch.php und .mp4) abdecken
             val candidateSlugs = listOfNotNull(searchSlug, cleanSlug).distinct()
             for (slug in candidateSlugs) {
                 val dsplayerVariants = listOf(
