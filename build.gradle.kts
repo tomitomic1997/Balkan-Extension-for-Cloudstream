@@ -7,17 +7,12 @@ buildscript {
     repositories {
         google()
         mavenCentral()
-        maven("https://jitpack.io") {
-            metadataSources {
-                artifact()
-            }
-        }
+        maven("https://jitpack.io")
     }
 
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
-        classpath("com.github.recloudstream:gradle:master-32895aedb6-1")
-        classpath("com.github.vidstige:jadb:v1.2.1")
+        classpath("com.github.recloudstream.gradle:gradle:master-32895aedb6-1")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
     }
 }
