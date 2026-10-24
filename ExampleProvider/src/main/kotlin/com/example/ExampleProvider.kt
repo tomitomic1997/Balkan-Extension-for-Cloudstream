@@ -245,7 +245,7 @@ class ExYuTeka : MainAPI() {
         }
     }
 
-    private fun addStreamLink(
+    private suspend fun addStreamLink(
         rawUrl: String,
         refererUrl: String,
         serverName: String,
@@ -296,7 +296,7 @@ class ExYuTeka : MainAPI() {
         val unescaped = html.replace("\\/", "/")
 
         // 1. SERVER EXYU: yustream.org (Direkt-MP4 1080p)
-        Regex("""https?://(?:www\.)?yustream\.org/[^\s"'<>\\]+""").findAll(unescaped).forEach { m ->
+        for (m in Regex("""https?://(?:www\.)?yustream\.org/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
             if (u.endsWith(".mp4") || u.contains("/uploads/")) {
                 addStreamLink(u, refererUrl, "Server EXYU", emittedStreams, callback, Qualities.P1080)
@@ -304,7 +304,7 @@ class ExYuTeka : MainAPI() {
         }
 
         // 2. SERVER FILEMOON / BYSE: n1mwq.org
-        Regex("""https?://(?:n1mwq\.org|filemoon\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped).forEach { m ->
+        for (m in Regex("""https?://(?:n1mwq\.org|filemoon\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
             if (u.contains("n1mwq.org") || u.contains("byse")) {
                 try {
@@ -324,7 +324,7 @@ class ExYuTeka : MainAPI() {
         }
 
         // 3. SERVER VIDHIDE: callistanise.com
-        Regex("""https?://(?:callistanise\.com|vidhide\.[a-z]+|vidhidepro\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped).forEach { m ->
+        for (m in Regex("""https?://(?:callistanise\.com|vidhide\.[a-z]+|vidhidepro\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
             if (u.contains("callistanise.com")) {
                 try {
@@ -344,7 +344,7 @@ class ExYuTeka : MainAPI() {
         }
 
         // 4. SERVER ABYS: play.abyssplayer.com
-        Regex("""https?://(?:play\.)?abyssplayer\.com/[^\s"'<>\\]+""").findAll(unescaped).forEach { m ->
+        for (m in Regex("""https?://(?:play\.)?abyssplayer\.com/[^\s"'<>\\]+""").findAll(unescaped)) {
             val abyssUrl = m.value.trim()
             try {
                 val res = app.get(abyssUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to refererUrl))
@@ -370,7 +370,7 @@ class ExYuTeka : MainAPI() {
         }
 
         // 5. SERVER STREAM / STREAMTAPE
-        Regex("""https?://(?:streamtape\.com|streamtape\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped).forEach { m ->
+        for (m in Regex("""https?://(?:streamtape\.com|streamtape\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
             try {
                 loadExtractor(u, refererUrl, subtitleCallback, callback)
