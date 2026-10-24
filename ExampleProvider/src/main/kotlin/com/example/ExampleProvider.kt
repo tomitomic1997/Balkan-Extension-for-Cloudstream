@@ -255,7 +255,7 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         val streamUrl = fixUrl(rawUrl.replace("\\/", "/").trim())
         
-        // Blockiert Webseiten, PHP-Skripte und Platzhalter (verhindert Fehler 3003)
+        // Blockiert Webseiten, fehlerhafte HTML-Container und Scripts (verhindert Code 3003)
         if (streamUrl.isEmpty() || streamUrl.contains(".php") || streamUrl.contains("/watch") ||
             streamUrl.contains("/embed") || streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") ||
             streamUrl.endsWith(".js") || streamUrl.endsWith(".css") || streamUrl.endsWith(".svg")
@@ -286,39 +286,43 @@ class ExYuTeka : MainAPI() {
         return false
     }
 
-    private suspend fun scanHtmlForServers(
+    private suspend fun scanHtmlAndExtract(
         html: String,
-        refererUrl: String,
+        currentUrl: String,
         emittedStreams: MutableSet<String>,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val unescaped = html.replace("\\/", "/")
+        val unescaped = if (html.contains("eval(function(p,a,c,k,e,")) {
+            getAndUnpack(html).replace("\\/", "/")
+        } else {
+            html.replace("\\/", "/")
+        }
 
         // 1. SERVER EXYU: yustream.org (Direkt-MP4 1080p)
         for (m in Regex("""https?://(?:www\.)?yustream\.org/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
             if (u.endsWith(".mp4") || u.contains("/uploads/")) {
-                addStreamLink(u, refererUrl, "Server EXYU", emittedStreams, callback, Qualities.P1080)
+                addStreamLink(u, currentUrl, "Server EXYU", emittedStreams, callback, Qualities.P1080)
             }
         }
 
         // 2. SERVER FILEMOON / BYSE: n1mwq.org
         for (m in Regex("""https?://(?:n1mwq\.org|filemoon\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
-            if (u.contains("n1mwq.org") || u.contains("byse")) {
+            val id = Regex("""[a-zA-Z0-9]{8,}""").find(u.substringAfterLast("/"))?.value
+            if (id != null) {
                 try {
-                    val res = app.get(u, headers = mapOf("User-Agent" to userAgent, "Referer" to refererUrl)).text
-                    val unpacked = if (res.contains("eval(function(p,a,c,k,e,")) getAndUnpack(res).replace("\\/", "/") else res.replace("\\/", "/")
-                    val match = Regex("""["'](https?://[^"']*\.(?:m3u8|mp4)[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
-                        ?: Regex("""file\s*:\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
-                    if (match != null) {
-                        addStreamLink(match, u, "Filemoon", emittedStreams, callback, Qualities.P1080)
-                    }
+                    loadExtractor("https://filemoon.sx/e/$id", currentUrl, subtitleCallback, callback)
                 } catch (_: Exception) {}
-            } else {
+            }
+            if (u.contains("n1mwq.org")) {
                 try {
-                    loadExtractor(u, refererUrl, subtitleCallback, callback)
+                    val res = app.get(u, headers = mapOf("User-Agent" to userAgent, "Referer" to currentUrl)).text
+                    val direct = Regex("""["'](https?://[^"']*\.(?:m3u8|mp4)[^"']*)["']""").find(res)?.groupValues?.get(1)
+                    if (direct != null) {
+                        addStreamLink(direct, u, "Filemoon", emittedStreams, callback, Qualities.P1080)
+                    }
                 } catch (_: Exception) {}
             }
         }
@@ -326,19 +330,20 @@ class ExYuTeka : MainAPI() {
         // 3. SERVER VIDHIDE: callistanise.com
         for (m in Regex("""https?://(?:callistanise\.com|vidhide\.[a-z]+|vidhidepro\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
+            val id = Regex("""[a-zA-Z0-9]{8,}""").find(u.substringAfterLast("/"))?.value
+            if (id != null) {
+                try {
+                    loadExtractor("https://vidhidepro.com/embed/$id", currentUrl, subtitleCallback, callback)
+                } catch (_: Exception) {}
+            }
             if (u.contains("callistanise.com")) {
                 try {
-                    val res = app.get(u, headers = mapOf("User-Agent" to userAgent, "Referer" to refererUrl)).text
-                    val unpacked = if (res.contains("eval(function(p,a,c,k,e,")) getAndUnpack(res).replace("\\/", "/") else res.replace("\\/", "/")
-                    val match = Regex("""["'](https?://[^"']*\.(?:m3u8|mp4)[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
-                        ?: Regex("""file\s*:\s*["']([^"']+)["']""").find(unescaped)?.groupValues?.get(1)
-                    if (match != null) {
-                        addStreamLink(match, u, "Vidhide", emittedStreams, callback, Qualities.P1080)
+                    val res = app.get(u, headers = mapOf("User-Agent" to userAgent, "Referer" to currentUrl)).text
+                    val unp = if (res.contains("eval(function(p,a,c,k,e,")) getAndUnpack(res).replace("\\/", "/") else res.replace("\\/", "/")
+                    val direct = Regex("""["'](https?://[^"']*\.(?:m3u8|mp4)[^"']*)["']""").find(unp)?.groupValues?.get(1)
+                    if (direct != null) {
+                        addStreamLink(direct, u, "Vidhide", emittedStreams, callback, Qualities.P1080)
                     }
-                } catch (_: Exception) {}
-            } else {
-                try {
-                    loadExtractor(u, refererUrl, subtitleCallback, callback)
                 } catch (_: Exception) {}
             }
         }
@@ -347,7 +352,7 @@ class ExYuTeka : MainAPI() {
         for (m in Regex("""https?://(?:play\.)?abyssplayer\.com/[^\s"'<>\\]+""").findAll(unescaped)) {
             val abyssUrl = m.value.trim()
             try {
-                val res = app.get(abyssUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to refererUrl))
+                val res = app.get(abyssUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to currentUrl))
                 var found = false
                 for (v in res.document.select("video source, video")) {
                     val src = v.attr("src").ifEmpty { v.attr("data-src") }
@@ -359,11 +364,9 @@ class ExYuTeka : MainAPI() {
                     }
                 }
                 if (!found) {
-                    val unescapedDoc = if (res.text.contains("eval(function(p,a,c,k,e,")) getAndUnpack(res.text).replace("\\/", "/") else res.text.replace("\\/", "/")
-                    val match = Regex("""["'](https?://[^"']*\.(?:m3u8|mp4)[^"']*)["']""").find(unescapedDoc)?.groupValues?.get(1)
-                        ?: Regex("""file\s*:\s*["']([^"']+)["']""").find(unescapedDoc)?.groupValues?.get(1)
-                    if (match != null) {
-                        addStreamLink(match, abyssUrl, "Server ABYS", emittedStreams, callback, Qualities.P480)
+                    val direct = Regex("""["'](https?://[^"']*\.(?:m3u8|mp4)[^"']*)["']""").find(res.text)?.groupValues?.get(1)
+                    if (direct != null) {
+                        addStreamLink(direct, abyssUrl, "Server ABYS", emittedStreams, callback, Qualities.P480)
                     }
                 }
             } catch (_: Exception) {}
@@ -373,57 +376,9 @@ class ExYuTeka : MainAPI() {
         for (m in Regex("""https?://(?:streamtape\.com|streamtape\.[a-z]+)/[^\s"'<>\\]+""").findAll(unescaped)) {
             val u = m.value.trim()
             try {
-                loadExtractor(u, refererUrl, subtitleCallback, callback)
+                loadExtractor(u, currentUrl, subtitleCallback, callback)
             } catch (_: Exception) {}
         }
-    }
-
-    private suspend fun extractSingleDsPlayerStream(
-        playerUrl: String,
-        referer: String,
-        emittedStreams: MutableSet<String>,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        try {
-            val res = app.get(playerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
-            val doc = res.document
-            val html = res.text
-
-            // 1. Genau den ersten funktionierenden Video-Tag nehmen und sofort beenden
-            for (v in doc.select("video source, video")) {
-                val src = v.attr("src").ifEmpty { v.attr("data-src") }
-                if (src.isNotEmpty() && !src.startsWith("blob:") && !src.contains(".php") && !src.contains("/watch")) {
-                    if (addStreamLink(src, playerUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
-                        return true
-                    }
-                }
-            }
-
-            // 2. Falls kein direkter Tag existiert: Regex im Script auswerten
-            val unescaped = if (html.contains("eval(function(p,a,c,k,e,")) {
-                getAndUnpack(html).replace("\\/", "/")
-            } else {
-                html.replace("\\/", "/")
-            }
-
-            val patterns = listOf(
-                Regex("""["'](https?://cdn\.dsplayer\.site/video/[^"']*\.mp4[^"']*)["']"""),
-                Regex("""["'](https?://[^"']*\.mp4[^"']*)["']"""),
-                Regex("""["'](https?://[^"']*\.m3u8[^"']*)["']""")
-            )
-
-            for (p in patterns) {
-                for (m in p.findAll(unescaped)) {
-                    val candidate = m.groupValues[1]
-                    if (!candidate.contains(".php") && !candidate.contains("/watch") && !candidate.contains("/embed")) {
-                        if (addStreamLink(candidate, playerUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
-                            return true
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-        return false
     }
 
     override suspend fun loadLinks(
@@ -434,17 +389,17 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         val emittedStreams = mutableSetOf<String>()
         val visitedUrls = mutableSetOf<String>()
-        var dsFound = false
+        var dsServerAdded = false
 
         val mainResponse = app.get(data, headers = headers)
         val mainDoc = mainResponse.document
         val mainHtml = mainResponse.text
 
-        // 1. Filmseite nach Server-Links durchsuchen
-        scanHtmlForServers(mainHtml, data, emittedStreams, subtitleCallback, callback)
+        // 1. Film-Hauptseite scannen
+        scanHtmlAndExtract(mainHtml, data, emittedStreams, subtitleCallback, callback)
 
-        // 2. Alle Player-Frames und Buttons einsammeln
-        val embedUrls = mutableSetOf<String>()
+        // 2. Alle Frame- und Player-Links zusammentragen
+        val framesToScan = mutableSetOf<String>()
 
         mainDoc.select("iframe, [data-src], [data-url], [data-embed]").forEach { elem ->
             val src = elem.attr("src").ifEmpty {
@@ -453,76 +408,83 @@ class ExYuTeka : MainAPI() {
                 }
             }
             if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically") && !src.contains("al5sm")) {
-                embedUrls.add(fixUrl(src))
+                framesToScan.add(fixUrl(src))
             }
         }
 
         mainDoc.select("[onclick]").forEach { el ->
             Regex("""(?:https?:)?//[^\s'"\(\)]+""").findAll(el.attr("onclick")).forEach { m ->
-                embedUrls.add(fixUrl(m.value))
+                framesToScan.add(fixUrl(m.value))
             }
         }
 
-        // Server-Tabs (sro1..5 und srofilm1..5) ableiten
-        val sroCandidates = mutableSetOf<String>()
-        for (u in embedUrls) {
+        // Alle sro1..5 Server-Tabs berücksichtigen
+        val sroList = mutableSetOf<String>()
+        for (u in framesToScan) {
             if (u.contains("sro")) {
                 for (i in 1..5) {
-                    sroCandidates.add(u.replace(Regex("""sro[a-zA-Z0-9]*\.php"""), "sro$i.php"))
-                    sroCandidates.add(u.replace(Regex("""sro[a-zA-Z0-9]*\.php"""), "srofilm$i.php"))
+                    sroList.add(u.replace(Regex("""sro[a-zA-Z0-9]*\.php"""), "sro$i.php"))
+                    sroList.add(u.replace(Regex("""sro[a-zA-Z0-9]*\.php"""), "srofilm$i.php"))
                 }
             }
         }
-        embedUrls.addAll(sroCandidates)
+        framesToScan.addAll(sroList)
 
-        // Slugs für DSPlayer generieren
-        val dsUrls = mutableSetOf<String>()
-        for (u in embedUrls) {
+        // DSPlayer Direktaufrufe generieren
+        for (u in framesToScan.toList()) {
             val slug = Regex("""[?&]search=([^&]+)""").find(u)?.groupValues?.get(1)
             val cleanSlug = slug?.removePrefix("rs-")?.removePrefix("glo-")
             listOfNotNull(cleanSlug, slug).distinct().forEach { s ->
-                dsUrls.add("https://dsplayer.site/watch.php?v=$s.mp4")
-                dsUrls.add("https://dsplayer.site/watch.php?v=$s")
-                dsUrls.add("https://dsplayer.site/embed2/video.php?slug=$s")
+                framesToScan.add("https://dsplayer.site/embed2/video.php?slug=$s")
+                framesToScan.add("https://dsplayer.site/watch.php?v=$s.mp4")
             }
         }
 
-        // 3. DSPlayer abrufen: Exakt 1 funktionierenden DSServer-Stream holen & Frame nach den anderen Hoster-Buttons durchsuchen
-        for (dsUrl in dsUrls) {
-            if (!visitedUrls.add(dsUrl)) continue
+        // 3. Frames tatsächlich per HTTP GET abrufen und deren Inhalte parsen
+        for (frameUrl in framesToScan) {
+            if (visitedUrls.size >= 8) break
+            if (!visitedUrls.add(frameUrl)) continue
+
             try {
-                val res = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
-                val html = res.text
+                val res = app.get(frameUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
+                val frameHtml = res.text
+                val frameDoc = res.document
 
-                // Liest EXYU, Filemoon, ABYS, Vidhide direkt aus dem DSPlayer-Menü aus
-                scanHtmlForServers(html, dsUrl, emittedStreams, subtitleCallback, callback)
+                // Inhalt des Frames nach EXYU, Filemoon, Vidhide, ABYS und StreamTape durchsuchen
+                scanHtmlAndExtract(frameHtml, frameUrl, emittedStreams, subtitleCallback, callback)
 
-                if (!dsFound && extractSingleDsPlayerStream(dsUrl, data, emittedStreams, callback)) {
-                    dsFound = true
-                }
-            } catch (_: Exception) {}
-        }
-
-        // 4. Server-Seiten (sro1.php bis sro5.php) nach restlichen Hostern durchsuchen
-        for (pageUrl in embedUrls) {
-            if (!visitedUrls.add(pageUrl)) continue
-            try {
-                val res = app.get(pageUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
-                val html = res.text
-                val doc = res.document
-
-                scanHtmlForServers(html, pageUrl, emittedStreams, subtitleCallback, callback)
-
-                for (ifr in doc.select("iframe")) {
-                    val ifrSrc = ifr.attr("src").ifEmpty { ifr.attr("data-src") }
-                    if (ifrSrc.isNotEmpty()) {
-                        scanHtmlForServers(fixUrl(ifrSrc), pageUrl, emittedStreams, subtitleCallback, callback)
+                // Untergeordnete Iframes innerhalb des Frames ebenfalls sofort untersuchen
+                for (childIfr in frameDoc.select("iframe")) {
+                    val childSrc = childIfr.attr("src").ifEmpty { childIfr.attr("data-src") }
+                    if (childSrc.isNotEmpty() && visitedUrls.add(fixUrl(childSrc))) {
+                        try {
+                            val childRes = app.get(fixUrl(childSrc), headers = mapOf("User-Agent" to userAgent, "Referer" to frameUrl))
+                            scanHtmlAndExtract(childRes.text, fixUrl(childSrc), emittedStreams, subtitleCallback, callback)
+                        } catch (_: Exception) {}
                     }
                 }
 
-                if (!dsFound && pageUrl.contains("dsplayer.site")) {
-                    if (extractSingleDsPlayerStream(pageUrl, data, emittedStreams, callback)) {
-                        dsFound = true
+                // DSServer (exakt 1 funktionierenden 1080p Stream extrahieren und danach dauerhaft sperren)
+                if (!dsServerAdded && frameUrl.contains("dsplayer.site")) {
+                    for (v in frameDoc.select("video source, video")) {
+                        val src = v.attr("src").ifEmpty { v.attr("data-src") }
+                        if (src.isNotEmpty() && !src.startsWith("blob:") && !src.contains(".php") && !src.contains("/watch")) {
+                            if (addStreamLink(src, frameUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
+                                dsServerAdded = true
+                                break
+                            }
+                        }
+                    }
+
+                    if (!dsServerAdded) {
+                        val unp = if (frameHtml.contains("eval(function(p,a,c,k,e,")) getAndUnpack(frameHtml).replace("\\/", "/") else frameHtml.replace("\\/", "/")
+                        val pattern = Regex("""["'](https?://cdn\.dsplayer\.site/video/[^"']*\.mp4[^"']*)["']""")
+                        val candidate = pattern.find(unp)?.groupValues?.get(1)
+                        if (candidate != null) {
+                            if (addStreamLink(candidate, frameUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
+                                dsServerAdded = true
+                            }
+                        }
                     }
                 }
             } catch (_: Exception) {}
