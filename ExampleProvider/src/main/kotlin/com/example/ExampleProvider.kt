@@ -245,7 +245,7 @@ class ExYuTeka : MainAPI() {
         }
     }
 
-    private fun addStreamLink(
+    private suspend fun addStreamLink(
         rawUrl: String,
         refererUrl: String,
         serverName: String,
