@@ -30,8 +30,7 @@ class ExYuTeka : MainAPI() {
         "$mainUrl/crtaci.php" to "Crtaći",
         "$mainUrl/rijaliti.php" to "Rijaliti TV",
         "$mainUrl/dokumentarne.php" to "Dokumentarne Emisije",
-        "$mainUrl/latino.php" to "Latino Serije",
-        "$mainUrl/korejske.php" to "Korejske Serije"
+        "$mainUrl/latino.php" to "Latino Serije"
     )
 
     private fun extractPoster(document: Document): String? {
@@ -91,16 +90,9 @@ class ExYuTeka : MainAPI() {
                 ?: img?.attr("src")?.ifEmpty { null }
         )
 
-        if (posterUrl == null) {
-            val bgStyle = element.selectFirst("[style*='background']")?.attr("style")
-                ?: targetLink.selectFirst("[style*='background']")?.attr("style")
-            val bgMatch = bgStyle?.let { Regex("""url\(['"]?([^'"\)]+)['"]?\)""").find(it)?.groupValues?.get(1) }
-            if (!bgMatch.isNullOrEmpty()) {
-                posterUrl = fixUrlNull(bgMatch)
-            }
+        if (posterUrl != null && (posterUrl.contains("/logo.") || posterUrl.endsWith("logo.png") || posterUrl.endsWith("logo.svg"))) {
+            posterUrl = null
         }
-
-        if (posterUrl != null && posterUrl.contains("logo") && !posterUrl.contains("slika")) return null
 
         val seriesName = element.selectFirst(".ep-series")?.text()?.trim()
         val epCode = element.selectFirst(".ep-code")?.text()?.trim()
@@ -113,7 +105,7 @@ class ExYuTeka : MainAPI() {
                 ?: img?.attr("alt")?.trim()?.ifEmpty { null }
                 ?: targetLink.attr("title").trim().ifEmpty { null }
                 ?: targetLink.text().trim().ifEmpty { null }
-                ?: return null
+                ?: href.removeSuffix("/").substringAfterLast("/").replace("-", " ")
         }
 
         if (title.lowercase() in listOf("početna", "filmovi", "serije", "najnovije", "nove epizode")) return null
@@ -149,34 +141,38 @@ class ExYuTeka : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val reqData = request.data
+        return try {
+            val reqData = request.data
 
-        if (reqData.startsWith("$mainUrl/#trending-")) {
-            val document = app.get(mainUrl, headers = headers).document
-            val results = mutableListOf<SearchResponse>()
-            val isSeriesTrending = reqData.endsWith("serije")
+            if (reqData.startsWith("$mainUrl/#trending-")) {
+                val document = app.get(mainUrl, headers = headers).document
+                val isSeriesTrending = reqData.endsWith("serije")
+                val targetHeader = if (isSeriesTrending) "Trending Serije" else "Trending Filmovi"
 
-            val targetHeader = if (isSeriesTrending) "Trending Serije" else "Trending Filmovi"
-            val section = document.select("section.section").firstOrNull { sec ->
-                sec.selectFirst(".section-title")?.text()?.contains(targetHeader, ignoreCase = true) == true
-            }
-
-            if (section != null) {
-                for (link in section.select("a.card, div.card")) {
-                    parseCardElement(link)?.let { results.add(it) }
+                val section = document.select("section.section, section, div").firstOrNull { sec ->
+                    sec.selectFirst(".section-title, h2, h3")?.text()?.contains(targetHeader, ignoreCase = true) == true
                 }
+
+                val results = mutableListOf<SearchResponse>()
+                if (section != null) {
+                    for (link in section.select("a.card, div.card, a[href*='/film/'], a[href*='/serija/']")) {
+                        parseCardElement(link)?.let { results.add(it) }
+                    }
+                }
+                if (results.isEmpty()) {
+                    results.addAll(parseCards(document))
+                }
+                newHomePageResponse(request.name, results.distinctBy { it.url }, hasNext = false)
             } else {
-                results.addAll(parseCards(document))
+                val url = if (page <= 1) reqData else "$reqData?strana=$page"
+                val document = app.get(url, headers = headers).document
+                val items = parseCards(document)
+                val hasNext = items.isNotEmpty() && document.select("a[href*='strana=${page + 1}']").isNotEmpty()
+                newHomePageResponse(request.name, items, hasNext = hasNext)
             }
-            return newHomePageResponse(request.name, results, hasNext = false)
+        } catch (_: Exception) {
+            newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
-
-        val url = if (page <= 1) reqData else "$reqData?strana=$page"
-        val document = app.get(url, headers = headers).document
-        val items = parseCards(document)
-        val hasNext = items.isNotEmpty() && document.select("a[href*='strana=${page + 1}']").isNotEmpty()
-
-        return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -315,7 +311,7 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         val streamUrl = fixUrl(rawUrl.replace("\\/", "/").trim())
 
-        // Blockiert Webseiten, fehlerhafte Container und Script-Dateien (verhindert Fehler 3003)
+        // Blockiert Webseiten, fehlerhafte HTML-Seiten und Scripts (verhindert Code 3003)
         if (streamUrl.isEmpty() || streamUrl.contains(".php") || streamUrl.contains("/watch") ||
             streamUrl.contains("/embed") || streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") ||
             streamUrl.endsWith(".js") || streamUrl.endsWith(".css") || streamUrl.endsWith(".svg")
@@ -326,8 +322,7 @@ class ExYuTeka : MainAPI() {
         val cleanUrl = streamUrl.substringBefore("?")
         val isM3u8 = cleanUrl.endsWith(".m3u8") || streamUrl.contains(".m3u8")
         val isMp4 = cleanUrl.endsWith(".mp4") || streamUrl.contains("/video/") ||
-                streamUrl.contains("cdn.dsplayer.site") ||
-                streamUrl.contains("yustream.org")
+                streamUrl.contains("dsplayer") || streamUrl.contains("yustream.org")
 
         if (isM3u8 || isMp4) {
             callback.invoke(
@@ -353,11 +348,11 @@ class ExYuTeka : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val res = app.get(playerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+            val res = app.get(playerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
             val doc = res.document
             val html = res.text
 
-            // 1. Direkte Videotags im DSPlayer
+            // 1. Direkter Video-Tag
             for (v in doc.select("video source, video")) {
                 val src = v.attr("src").ifEmpty { v.attr("data-src") }
                 if (src.isNotEmpty() && !src.startsWith("blob:") && !src.contains(".php") && !src.contains("/watch")) {
@@ -367,7 +362,7 @@ class ExYuTeka : MainAPI() {
                 }
             }
 
-            // 2. JavaScript-Packer entpacken
+            // 2. JavaScript / Packer nach MP4 oder M3U8 durchsuchen
             val unp = if (html.contains("eval(function(p,a,c,k,e,")) {
                 getAndUnpack(html).replace("\\/", "/")
             } else {
@@ -375,18 +370,20 @@ class ExYuTeka : MainAPI() {
             }
 
             val patterns = listOf(
-                Regex("""["'](https?://cdn\.dsplayer\.site/video/[^"']*\.mp4[^"']*)["']"""),
-                Regex("""["'](https?://[^"']*(?:cdn\.dsplayer\.site)[^"']*\.mp4[^"']*)["']"""),
-                Regex("""file\s*:\s*["']([^"']+\.mp4[^"']*)["']"""),
-                Regex("""source\s*:\s*["']([^"']+\.mp4[^"']*)["']"""),
-                Regex("""src\s*:\s*["']([^"']+\.mp4[^"']*)["']""")
+                Regex("""["'](https?://[^"']*\.mp4[^"']*)["']"""),
+                Regex("""["'](https?://[^"']*\.m3u8[^"']*)["']"""),
+                Regex("""["'](https?://[^"']*(?:dsplayer)[^"']*)["']"""),
+                Regex("""file\s*:\s*["']([^"']+)["']"""),
+                Regex("""source\s*:\s*["']([^"']+)["']""")
             )
 
             for (p in patterns) {
-                val candidate = p.find(unp)?.groupValues?.get(1)?.trim()
-                if (!candidate.isNullOrEmpty() && !candidate.contains(".php") && !candidate.contains("/watch") && !candidate.contains("/embed")) {
-                    if (addStreamLink(candidate, playerUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
-                        return true
+                for (m in p.findAll(unp)) {
+                    val candidate = m.groupValues[1].trim()
+                    if (!candidate.contains(".php") && !candidate.contains("/watch") && !candidate.contains("/embed")) {
+                        if (addStreamLink(candidate, playerUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
+                            return true
+                        }
                     }
                 }
             }
@@ -521,14 +518,12 @@ class ExYuTeka : MainAPI() {
         // 1. SLUGS IDENTIFIZIEREN (Filme & Serien)
         val candidateSlugs = mutableSetOf<String>()
 
-        // Aus dem Pfad der aktuellen Seite (z. B. /film/drazen-2024 -> drazen-2024)
         val urlSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
         if (urlSlug.isNotEmpty() && urlSlug != "film" && urlSlug != "serija") {
             candidateSlugs.add(urlSlug)
             candidateSlugs.add(urlSlug.removePrefix("rs-").removePrefix("glo-"))
         }
 
-        // Aus allen Query-Parametern der Seite und der Frames
         val allSources = mutableListOf(mainHtml, data)
         allSources.addAll(framesToScan)
 
@@ -551,10 +546,10 @@ class ExYuTeka : MainAPI() {
             for (s in slugVariants) {
                 if (dsServerAdded) break
                 val dsVariants = listOf(
-                    "https://dsplayer.site/embed2/video.php?slug=$s",
-                    "https://dsplayer.site/video.php?slug=$s",
                     "https://dsplayer.site/watch.php?v=$s.mp4",
-                    "https://dsplayer.site/watch.php?v=$s"
+                    "https://dsplayer.site/watch.php?v=$s",
+                    "https://dsplayer.site/embed2/video.php?slug=$s",
+                    "https://dsplayer.site/video.php?slug=$s"
                 )
                 for (dsUrl in dsVariants) {
                     if (dsServerAdded) break
