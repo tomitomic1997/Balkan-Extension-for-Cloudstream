@@ -30,47 +30,9 @@ class ExYuTeka : MainAPI() {
         "$mainUrl/crtaci.php" to "Crtaći",
         "$mainUrl/rijaliti.php" to "Rijaliti TV",
         "$mainUrl/dokumentarne.php" to "Dokumentarne Emisije",
-        "$mainUrl/latino.php" to "Latino Serije"
+        "$mainUrl/latino.php" to "Latino Serije",
+        "$mainUrl/korejske.php" to "Korejske Serije"
     )
-
-    private fun extractPoster(document: Document): String? {
-        val ogImage = document.selectFirst("meta[property='og:image'], meta[name='twitter:image']")
-            ?.attr("content")?.ifEmpty { null }
-            ?: document.selectFirst("link[rel='image_src']")?.attr("href")?.ifEmpty { null }
-
-        if (!ogImage.isNullOrEmpty() && !ogImage.contains("logo") && !ogImage.contains("clickonserver")) {
-            return fixUrlNull(ogImage)
-        }
-
-        val imgElem = document.selectFirst(
-            ".single-poster img, .poster img, .poster-img, .movie-poster img, " +
-            "img[src*='/slika'], img[data-src*='/slika'], img[src*='/poster'], img[data-src*='/poster'], " +
-            ".single-cover img, .film-poster img, .entry-poster img, img.slika, img.poster"
-        ) ?: document.selectFirst(".single-content img, .content img, article img")
-
-        val imgUrl = imgElem?.let { img ->
-            img.attr("data-src").ifEmpty { null }
-                ?: img.attr("data-lazy-src").ifEmpty { null }
-                ?: img.attr("data-original").ifEmpty { null }
-                ?: img.attr("src").ifEmpty { null }
-                ?: img.attr("srcset").ifEmpty { null }?.substringBefore(" ")
-        }
-
-        if (!imgUrl.isNullOrEmpty() && !imgUrl.contains("logo") && !imgUrl.contains("clickonserver")) {
-            return fixUrlNull(imgUrl)
-        }
-
-        val bgElem = document.selectFirst("[style*='background-image'], [style*='background:url'], [style*='background: url']")
-        if (bgElem != null) {
-            val style = bgElem.attr("style")
-            val bgUrl = Regex("""url\(['"]?([^'"\)]+)['"]?\)""").find(style)?.groupValues?.get(1)
-            if (!bgUrl.isNullOrEmpty() && !bgUrl.contains("logo") && !bgUrl.contains("clickonserver")) {
-                return fixUrlNull(bgUrl)
-            }
-        }
-
-        return null
-    }
 
     private fun parseCardElement(element: Element): SearchResponse? {
         val targetLink = if (element.tagName() == "a") {
@@ -83,16 +45,13 @@ class ExYuTeka : MainAPI() {
         if (href == mainUrl || href == "$mainUrl/" || href.endsWith(".php") || href.endsWith("#")) return null
 
         val img = element.selectFirst("img") ?: targetLink.selectFirst("img") ?: element.parent()?.selectFirst("img")
-        var posterUrl = fixUrlNull(
+        val posterUrl = fixUrlNull(
             img?.attr("data-src")?.ifEmpty { null }
                 ?: img?.attr("data-lazy-src")?.ifEmpty { null }
                 ?: img?.attr("data-original")?.ifEmpty { null }
                 ?: img?.attr("src")?.ifEmpty { null }
         )
-
-        if (posterUrl != null && (posterUrl.contains("/logo.") || posterUrl.endsWith("logo.png") || posterUrl.endsWith("logo.svg"))) {
-            posterUrl = null
-        }
+        if (posterUrl != null && posterUrl.contains("logo") && !posterUrl.contains("slika")) return null
 
         val seriesName = element.selectFirst(".ep-series")?.text()?.trim()
         val epCode = element.selectFirst(".ep-code")?.text()?.trim()
@@ -105,7 +64,7 @@ class ExYuTeka : MainAPI() {
                 ?: img?.attr("alt")?.trim()?.ifEmpty { null }
                 ?: targetLink.attr("title").trim().ifEmpty { null }
                 ?: targetLink.text().trim().ifEmpty { null }
-                ?: href.removeSuffix("/").substringAfterLast("/").replace("-", " ")
+                ?: return null
         }
 
         if (title.lowercase() in listOf("početna", "filmovi", "serije", "najnovije", "nove epizode")) return null
@@ -141,38 +100,34 @@ class ExYuTeka : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        return try {
-            val reqData = request.data
+        val reqData = request.data
 
-            if (reqData.startsWith("$mainUrl/#trending-")) {
-                val document = app.get(mainUrl, headers = headers).document
-                val isSeriesTrending = reqData.endsWith("serije")
-                val targetHeader = if (isSeriesTrending) "Trending Serije" else "Trending Filmovi"
+        if (reqData.startsWith("$mainUrl/#trending-")) {
+            val document = app.get(mainUrl, headers = headers).document
+            val results = mutableListOf<SearchResponse>()
+            val isSeriesTrending = reqData.endsWith("serije")
 
-                val section = document.select("section.section, section, div").firstOrNull { sec ->
-                    sec.selectFirst(".section-title, h2, h3")?.text()?.contains(targetHeader, ignoreCase = true) == true
-                }
-
-                val results = mutableListOf<SearchResponse>()
-                if (section != null) {
-                    for (link in section.select("a.card, div.card, a[href*='/film/'], a[href*='/serija/']")) {
-                        parseCardElement(link)?.let { results.add(it) }
-                    }
-                }
-                if (results.isEmpty()) {
-                    results.addAll(parseCards(document))
-                }
-                newHomePageResponse(request.name, results.distinctBy { it.url }, hasNext = false)
-            } else {
-                val url = if (page <= 1) reqData else "$reqData?strana=$page"
-                val document = app.get(url, headers = headers).document
-                val items = parseCards(document)
-                val hasNext = items.isNotEmpty() && document.select("a[href*='strana=${page + 1}']").isNotEmpty()
-                newHomePageResponse(request.name, items, hasNext = hasNext)
+            val targetHeader = if (isSeriesTrending) "Trending Serije" else "Trending Filmovi"
+            val section = document.select("section.section").firstOrNull { sec ->
+                sec.selectFirst(".section-title")?.text()?.contains(targetHeader, ignoreCase = true) == true
             }
-        } catch (_: Exception) {
-            newHomePageResponse(request.name, emptyList(), hasNext = false)
+
+            if (section != null) {
+                for (link in section.select("a.card, div.card")) {
+                    parseCardElement(link)?.let { results.add(it) }
+                }
+            } else {
+                results.addAll(parseCards(document))
+            }
+            return newHomePageResponse(request.name, results, hasNext = false)
         }
+
+        val url = if (page <= 1) reqData else "$reqData?strana=$page"
+        val document = app.get(url, headers = headers).document
+        val items = parseCards(document)
+        val hasNext = items.isNotEmpty() && document.select("a[href*='strana=${page + 1}']").isNotEmpty()
+
+        return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -206,7 +161,11 @@ class ExYuTeka : MainAPI() {
         }
 
         val title = document.selectFirst(".single-title, h1, .title")?.text()?.trim() ?: "ExYuTeka"
-        val posterUrl = extractPoster(document)
+        val posterUrl = fixUrlNull(
+            document.selectFirst(".single-poster img, .poster img, img[src*='/slika']")?.attr("data-src")?.ifEmpty { null }
+                ?: document.selectFirst(".single-poster img, .poster img, img[src*='/slika']")?.attr("src")?.ifEmpty { null }
+                ?: document.selectFirst("meta[property='og:image']")?.attr("content")?.ifEmpty { null }
+        )
         val plot = document.selectFirst(".single-desc, .description, p")?.text()?.trim()
         val year = document.selectFirst(".single-meta")?.text()?.let {
             Regex("""\b(19\d{2}|20\d{2})\b""").find(it)?.value?.toIntOrNull()
@@ -237,7 +196,6 @@ class ExYuTeka : MainAPI() {
                         val epImg = epElem.selectFirst("img")
                         val epPoster = fixUrlNull(
                             epImg?.attr("data-src")?.ifEmpty { null }
-                                ?: epImg?.attr("data-lazy-src")?.ifEmpty { null }
                                 ?: epImg?.attr("src")?.ifEmpty { null }
                         ) ?: posterUrl
 
@@ -267,7 +225,6 @@ class ExYuTeka : MainAPI() {
                     val epImg = epElem.selectFirst("img")
                     val epPoster = fixUrlNull(
                         epImg?.attr("data-src")?.ifEmpty { null }
-                            ?: epImg?.attr("data-lazy-src")?.ifEmpty { null }
                             ?: epImg?.attr("src")?.ifEmpty { null }
                     ) ?: posterUrl
 
@@ -310,11 +267,9 @@ class ExYuTeka : MainAPI() {
         quality: Qualities = Qualities.P1080
     ): Boolean {
         val streamUrl = fixUrl(rawUrl.replace("\\/", "/").trim())
-
-        // Blockiert Webseiten, fehlerhafte HTML-Seiten und Scripts (verhindert Code 3003)
         if (streamUrl.isEmpty() || streamUrl.contains(".php") || streamUrl.contains("/watch") ||
-            streamUrl.contains("/embed") || streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") ||
-            streamUrl.endsWith(".js") || streamUrl.endsWith(".css") || streamUrl.endsWith(".svg")
+            streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") || streamUrl.endsWith(".js") ||
+            streamUrl.endsWith(".css") || streamUrl.endsWith(".svg")
         ) return false
 
         if (!emittedStreams.add(streamUrl)) return false
@@ -322,7 +277,7 @@ class ExYuTeka : MainAPI() {
         val cleanUrl = streamUrl.substringBefore("?")
         val isM3u8 = cleanUrl.endsWith(".m3u8") || streamUrl.contains(".m3u8")
         val isMp4 = cleanUrl.endsWith(".mp4") || streamUrl.contains("/video/") ||
-                streamUrl.contains("dsplayer") || streamUrl.contains("yustream.org")
+                streamUrl.contains("cdn.dsplayer") || streamUrl.contains("yustream.org")
 
         if (isM3u8 || isMp4) {
             callback.invoke(
@@ -341,133 +296,48 @@ class ExYuTeka : MainAPI() {
         return false
     }
 
-    private suspend fun extractDsPlayer(
+    private suspend fun parseDsPlayer(
         playerUrl: String,
-        referer: String,
         emittedStreams: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        var found = false
         try {
-            val res = app.get(playerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
-            val doc = res.document
-            val html = res.text
+            val response = app.get(playerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+            val html = response.text
+            val doc = response.document
 
-            // 1. Direkter Video-Tag
             for (v in doc.select("video source, video")) {
                 val src = v.attr("src").ifEmpty { v.attr("data-src") }
-                if (src.isNotEmpty() && !src.startsWith("blob:") && !src.contains(".php") && !src.contains("/watch")) {
+                if (src.isNotEmpty() && !src.startsWith("blob:") && !src.contains(".php")) {
                     if (addStreamLink(src, playerUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
-                        return true
+                        found = true
                     }
                 }
-            }
-
-            // 2. JavaScript / Packer nach MP4 oder M3U8 durchsuchen
-            val unp = if (html.contains("eval(function(p,a,c,k,e,")) {
-                getAndUnpack(html).replace("\\/", "/")
-            } else {
-                html.replace("\\/", "/")
             }
 
             val patterns = listOf(
                 Regex("""["'](https?://[^"']*\.mp4[^"']*)["']"""),
                 Regex("""["'](https?://[^"']*\.m3u8[^"']*)["']"""),
-                Regex("""["'](https?://[^"']*(?:dsplayer)[^"']*)["']"""),
+                Regex("""["'](https?://cdn\.dsplayer\.site[^"']*)["']"""),
                 Regex("""file\s*:\s*["']([^"']+)["']"""),
                 Regex("""source\s*:\s*["']([^"']+)["']""")
             )
 
-            for (p in patterns) {
-                for (m in p.findAll(unp)) {
-                    val candidate = m.groupValues[1].trim()
-                    if (!candidate.contains(".php") && !candidate.contains("/watch") && !candidate.contains("/embed")) {
+            for (pattern in patterns) {
+                for (match in pattern.findAll(html)) {
+                    val candidate = match.groupValues[1]
+                    if (!candidate.contains(".php") && !candidate.contains("/watch")) {
                         if (addStreamLink(candidate, playerUrl, "DSServer", emittedStreams, callback, Qualities.P1080)) {
-                            return true
+                            found = true
+                            break
                         }
                     }
                 }
+                if (found) break
             }
         } catch (_: Exception) {}
-        return false
-    }
-
-    private suspend fun handleExtractedServerUrl(
-        url: String,
-        referer: String,
-        emittedStreams: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val cleanUrl = url.trim()
-
-        if (cleanUrl.contains("abyss") || cleanUrl.contains("sssrr.org")) return
-
-        if (cleanUrl.contains("yustream.org") && (cleanUrl.endsWith(".mp4") || cleanUrl.contains("/uploads/"))) {
-            addStreamLink(cleanUrl, referer, "Server EXYU", emittedStreams, callback, Qualities.P1080)
-            return
-        }
-
-        if (cleanUrl.contains("callistanise") || cleanUrl.contains("vidhide")) {
-            val id = Regex("""/([a-zA-Z0-9_-]{6,})""").find(cleanUrl.substringAfterLast("/"))?.groupValues?.get(1)
-                ?: cleanUrl.substringAfterLast("/").substringBefore("?")
-            if (id.isNotEmpty()) {
-                try {
-                    if (loadExtractor("https://vidhidepro.com/embed/$id", referer, subtitleCallback, callback)) return
-                } catch (_: Exception) {}
-                try {
-                    if (loadExtractor("https://vidhide.com/embed/$id", referer, subtitleCallback, callback)) return
-                } catch (_: Exception) {}
-            }
-            return
-        }
-
-        if (cleanUrl.contains("n1mwq") || cleanUrl.contains("filemoon") || cleanUrl.contains("byse")) {
-            val id = Regex("""/([a-zA-Z0-9_-]{6,})""").find(cleanUrl.substringAfterLast("/"))?.groupValues?.get(1)
-                ?: cleanUrl.substringAfterLast("/").substringBefore("?")
-            if (id.isNotEmpty()) {
-                try {
-                    if (loadExtractor("https://filemoon.sx/e/$id", referer, subtitleCallback, callback)) return
-                } catch (_: Exception) {}
-                try {
-                    if (loadExtractor("https://filemoon.to/e/$id", referer, subtitleCallback, callback)) return
-                } catch (_: Exception) {}
-            }
-            return
-        }
-
-        if (cleanUrl.contains("streamtape")) {
-            try {
-                loadExtractor(cleanUrl, referer, subtitleCallback, callback)
-            } catch (_: Exception) {}
-            return
-        }
-    }
-
-    private fun parseServerUrlsFromCode(html: String): List<String> {
-        val results = mutableListOf<String>()
-        val unescaped = if (html.contains("eval(function(p,a,c,k,e,")) {
-            getAndUnpack(html).replace("\\/", "/")
-        } else {
-            html.replace("\\/", "/")
-        }
-
-        val patterns = listOf(
-            Regex("""src\s*=\s*["'](https?://[^"']+)["']"""),
-            Regex("""["'](https?://(?:www\.)?yustream\.org/[^"']+)["']"""),
-            Regex("""["'](https?://(?:www\.)?callistanise\.com/[^"']+)["']"""),
-            Regex("""["'](https?://(?:www\.)?n1mwq\.org/[^"']+)["']"""),
-            Regex("""["'](https?://(?:www\.)?streamtape\.com/[^"']+)["']""")
-        )
-
-        for (p in patterns) {
-            for (m in p.findAll(unescaped)) {
-                val u = m.groupValues[1].trim()
-                if (!u.contains("abyss") && !u.contains("sssrr") && !results.contains(u)) {
-                    results.add(u)
-                }
-            }
-        }
-        return results
+        return found
     }
 
     override suspend fun loadLinks(
@@ -476,146 +346,128 @@ class ExYuTeka : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        var success = false
         val emittedStreams = mutableSetOf<String>()
         val visitedUrls = mutableSetOf<String>()
-        var dsServerAdded = false
 
-        val mainResponse = app.get(data, headers = headers)
-        val mainDoc = mainResponse.document
-        val mainHtml = mainResponse.text
+        val document = app.get(data, headers = headers).document
+        val embedUrls = mutableSetOf<String>()
 
-        val framesToScan = mutableSetOf<String>()
+        document.select("iframe").forEach {
+            val src = it.attr("src").ifEmpty { it.attr("data-src") }
+            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
+                embedUrls.add(fixUrl(src))
+            }
+        }
 
-        mainDoc.select("iframe, [data-src], [data-url], [data-embed]").forEach { elem ->
-            val src = elem.attr("src").ifEmpty {
-                elem.attr("data-src").ifEmpty {
-                    elem.attr("data-url").ifEmpty { elem.attr("data-embed") }
+        document.select("[data-src], [data-url], [data-embed]").forEach { elem ->
+            val u = elem.attr("data-src").ifEmpty { elem.attr("data-url").ifEmpty { elem.attr("data-embed") } }
+            if (u.contains("embed") || u.contains("php") || u.contains("dsplayer")) {
+                embedUrls.add(fixUrl(u))
+            }
+        }
+
+        val serverUrls = mutableSetOf<String>()
+        serverUrls.addAll(embedUrls)
+
+        for (embedUrl in embedUrls) {
+            if (embedUrl.contains(Regex("""sro\d*\.php"""))) {
+                for (sNum in 1..5) {
+                    serverUrls.add(embedUrl.replace(Regex("""sro\d*\.php"""), "sro$sNum.php"))
                 }
-            }
-            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically") && !src.contains("al5sm")) {
-                val fixed = fixUrl(src)
-                framesToScan.add(fixed)
-
-                if (fixed.contains("sro")) {
-                    for (i in 1..5) {
-                        framesToScan.add(fixed.replace(Regex("""sro[a-zA-Z0-9]*\.php"""), "sro$i.php"))
-                        framesToScan.add(fixed.replace(Regex("""sro[a-zA-Z0-9]*\.php"""), "srofilm$i.php"))
-                    }
-                }
-            }
-        }
-
-        Regex("""["']([^"']*(?:crtaci|sro\d*|srofilm\d*|embed\d*)\.php[^"']*)["']""").findAll(mainHtml).forEach { m ->
-            framesToScan.add(fixUrl(m.groupValues[1]))
-        }
-
-        mainDoc.select("[onclick]").forEach { el ->
-            Regex("""(?:https?:)?//[^\s'"\(\)]+""").findAll(el.attr("onclick")).forEach { m ->
-                framesToScan.add(fixUrl(m.value))
-            }
-        }
-
-        // 1. SLUGS IDENTIFIZIEREN (Filme & Serien)
-        val candidateSlugs = mutableSetOf<String>()
-
-        val urlSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
-        if (urlSlug.isNotEmpty() && urlSlug != "film" && urlSlug != "serija") {
-            candidateSlugs.add(urlSlug)
-            candidateSlugs.add(urlSlug.removePrefix("rs-").removePrefix("glo-"))
-        }
-
-        val allSources = mutableListOf(mainHtml, data)
-        allSources.addAll(framesToScan)
-
-        for (source in allSources) {
-            Regex("""[?&](?:search|v|slug|film|id)=([^&"'\s<>\\]+)""").findAll(source).forEach { m ->
-                val raw = m.groupValues[1].removeSuffix(".mp4").trim()
-                if (raw.isNotEmpty() && raw.length > 2) {
-                    candidateSlugs.add(raw)
-                    candidateSlugs.add(raw.removePrefix("rs-").removePrefix("glo-"))
+            } else if (embedUrl.contains("srofilm.php")) {
+                for (sNum in 1..5) {
+                    serverUrls.add(embedUrl.replace("srofilm.php", "sro$sNum.php"))
+                    serverUrls.add(embedUrl.replace("srofilm.php", "srofilm$sNum.php"))
                 }
             }
         }
 
-        // 2. DSSERVER LADEN
-        for (slug in candidateSlugs) {
-            if (dsServerAdded) break
-            val clean = slug.removePrefix("rs-").removePrefix("glo-")
-            val slugVariants = listOfNotNull(clean, "rs-$clean", "glo-$clean", slug).distinct()
+        // DSServer 1080p
+        var dsFound = false
+        for (embedUrl in embedUrls) {
+            val searchSlug = Regex("""[?&]search=([^&]+)""").find(embedUrl)?.groupValues?.get(1)
+            val cleanSlug = searchSlug?.removePrefix("rs-")?.removePrefix("glo-")
 
-            for (s in slugVariants) {
-                if (dsServerAdded) break
-                val dsVariants = listOf(
-                    "https://dsplayer.site/watch.php?v=$s.mp4",
-                    "https://dsplayer.site/watch.php?v=$s",
-                    "https://dsplayer.site/embed2/video.php?slug=$s",
-                    "https://dsplayer.site/video.php?slug=$s"
+            val candidateSlugs = listOfNotNull(cleanSlug, searchSlug).distinct()
+            for (slug in candidateSlugs) {
+                if (dsFound) break
+                val dsplayerVariants = listOf(
+                    "https://dsplayer.site/watch.php?v=$slug.mp4",
+                    "https://dsplayer.site/watch.php?v=$slug",
+                    "https://dsplayer.site/embed2/video.php?slug=$slug",
+                    "https://dsplayer.site/video.php?slug=$slug"
                 )
-                for (dsUrl in dsVariants) {
-                    if (dsServerAdded) break
-                    if (!visitedUrls.add(dsUrl)) continue
-                    try {
-                        if (extractDsPlayer(dsUrl, data, emittedStreams, callback)) {
-                            dsServerAdded = true
+                for (dsUrl in dsplayerVariants) {
+                    if (visitedUrls.add(dsUrl)) {
+                        if (parseDsPlayer(dsUrl, emittedStreams, callback)) {
+                            success = true
+                            dsFound = true
                             break
                         }
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-
-        // 3. DIREKTE DSPLAYER-URLS PRÜFEN
-        for (fUrl in framesToScan) {
-            if (dsServerAdded) break
-            if (fUrl.contains("dsplayer.site") && visitedUrls.add(fUrl)) {
-                try {
-                    if (extractDsPlayer(fUrl, data, emittedStreams, callback)) {
-                        dsServerAdded = true
-                        break
                     }
-                } catch (_: Exception) {}
+                }
             }
         }
 
-        // 4. WEITERE HOSTER-FRAMES ABSUCHEN
-        for (frameUrl in framesToScan) {
-            if (!visitedUrls.add(frameUrl)) continue
+        // Standard-Hoster & StreamTape
+        for (sUrl in serverUrls) {
+            if (!visitedUrls.add(sUrl)) continue
             try {
-                val res = app.get(frameUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
-                val frameHtml = res.text
-                val frameDoc = res.document
+                val sroResponse = app.get(sUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
+                val sroDoc = sroResponse.document
+                val sroHtml = sroResponse.text
 
-                for (eu in parseServerUrlsFromCode(frameHtml)) {
-                    handleExtractedServerUrl(eu, frameUrl, emittedStreams, subtitleCallback, callback)
+                val potentialLinks = mutableSetOf<String>()
+
+                sroDoc.select("iframe, a, button, div, li, [onclick], [data-src], [data-url], [data-embed]").forEach { el ->
+                    val src = el.attr("src").ifEmpty {
+                        el.attr("data-src").ifEmpty {
+                            el.attr("data-url").ifEmpty {
+                                el.attr("data-embed").ifEmpty {
+                                    el.attr("href")
+                                }
+                            }
+                        }
+                    }
+                    if (src.isNotEmpty() && !src.startsWith("#") && !src.startsWith("javascript")) {
+                        potentialLinks.add(fixUrl(src))
+                    }
+
+                    val oc = el.attr("onclick")
+                    if (oc.isNotEmpty()) {
+                        Regex("""(?:https?:)?//[^\s'"\(\)]+""").findAll(oc).forEach { m ->
+                            potentialLinks.add(fixUrl(m.value))
+                        }
+                    }
                 }
 
-                for (childIfr in frameDoc.select("iframe")) {
-                    val childSrc = childIfr.attr("src").ifEmpty { childIfr.attr("data-src") }
-                    if (childSrc.isNotEmpty()) {
-                        val fixedChild = fixUrl(childSrc)
-                        if (visitedUrls.add(fixedChild)) {
-                            try {
-                                val childRes = app.get(fixedChild, headers = mapOf("User-Agent" to userAgent, "Referer" to frameUrl))
-                                for (ceu in parseServerUrlsFromCode(childRes.text)) {
-                                    handleExtractedServerUrl(ceu, fixedChild, emittedStreams, subtitleCallback, callback)
-                                }
-                                if (!dsServerAdded && fixedChild.contains("dsplayer.site")) {
-                                    if (extractDsPlayer(fixedChild, frameUrl, emittedStreams, callback)) {
-                                        dsServerAdded = true
-                                    }
-                                }
-                            } catch (_: Exception) {}
-                        }
+                Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"'<>\\]+""").findAll(sroHtml).forEach { m ->
+                    potentialLinks.add(m.value.replace("\\/", "/"))
+                }
+
+                for (candUrl in potentialLinks) {
+                    if (candUrl.endsWith(".js") || candUrl.endsWith(".css") || candUrl.endsWith(".png") ||
+                        candUrl.endsWith(".jpg") || candUrl.endsWith(".svg") || candUrl.contains("googletag") ||
+                        candUrl.contains("managertechnically") || candUrl.contains("al5sm.com")
+                    ) continue
+
+                    // StreamTape & reguläre Hoster
+                    val isHoster = listOf(
+                        "streamtape", "dood", "ds2play", "mixdrop", "voe.sx", "ok.ru", "upstream", "supervideo", "dropload"
+                    ).any { candUrl.contains(it) }
+
+                    if (isHoster && visitedUrls.add(candUrl)) {
+                        try {
+                            if (loadExtractor(candUrl, sUrl, subtitleCallback, callback)) {
+                                success = true
+                            }
+                        } catch (_: Exception) {}
                     }
                 }
             } catch (_: Exception) {}
         }
 
-        // 5. DIREKTE LINKS AUF DER HAUPTSEITE
-        for (eu in parseServerUrlsFromCode(mainHtml)) {
-            handleExtractedServerUrl(eu, data, emittedStreams, subtitleCallback, callback)
-        }
-
-        return emittedStreams.isNotEmpty()
+        return success
     }
 }
