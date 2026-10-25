@@ -1,0 +1,17 @@
+[
+    {
+        "fileHash": "sha256-65025849c09e1c91d7b0706802c6981d58860fede630e107e623ec3c8bcd6d57",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/tomitomic1997/Balkan-Extension-for-Cloudstream",
+        "fileSize": 26471,
+        "status": 1,
+        "authors": [
+            "tomitomic1997"
+        ],
+        "version": 1,
+        "internalName": "ExYuTeka",
+        "description": "ExYuTeka - Filmovi i serije sa Balkana",
+        "url": "https://raw.githubusercontent.com/tomitomic1997/Balkan-Extension-for-Cloudstream/builds/ExYuTeka.cs3",
+        "name": "ExYuTeka"
+    }
+]
