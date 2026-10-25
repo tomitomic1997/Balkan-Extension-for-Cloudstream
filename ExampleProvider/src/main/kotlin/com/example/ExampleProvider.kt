@@ -34,6 +34,48 @@ class ExYuTeka : MainAPI() {
         "$mainUrl/korejske.php" to "Korejske Serije"
     )
 
+    private fun extractPoster(document: Document): String? {
+        // 1. Meta-Tags (OpenGraph / Twitter / Link-Cover) haben meist die beste Bildqualität
+        val ogImage = document.selectFirst("meta[property='og:image'], meta[name='twitter:image']")
+            ?.attr("content")?.ifEmpty { null }
+            ?: document.selectFirst("link[rel='image_src']")?.attr("href")?.ifEmpty { null }
+
+        if (!ogImage.isNullOrEmpty() && !ogImage.contains("logo") && !ogImage.contains("clickonserver")) {
+            return fixUrlNull(ogImage)
+        }
+
+        // 2. Gezielte Poster- und Cover-Klassen auf der Detailseite
+        val imgElem = document.selectFirst(
+            ".single-poster img, .poster img, .poster-img, .movie-poster img, " +
+            "img[src*='/slika'], img[data-src*='/slika'], img[src*='/poster'], img[data-src*='/poster'], " +
+            ".single-cover img, .film-poster img, .entry-poster img, img.slika, img.poster"
+        ) ?: document.selectFirst(".single-content img, .content img, article img")
+
+        val imgUrl = imgElem?.let { img ->
+            img.attr("data-src").ifEmpty { null }
+                ?: img.attr("data-lazy-src").ifEmpty { null }
+                ?: img.attr("data-original").ifEmpty { null }
+                ?: img.attr("src").ifEmpty { null }
+                ?: img.attr("srcset").ifEmpty { null }?.substringBefore(" ")
+        }
+
+        if (!imgUrl.isNullOrEmpty() && !imgUrl.contains("logo") && !imgUrl.contains("clickonserver")) {
+            return fixUrlNull(imgUrl)
+        }
+
+        // 3. Fallback: Inline CSS-Hintergrundbild
+        val bgElem = document.selectFirst("[style*='background-image'], [style*='background:url'], [style*='background: url']")
+        if (bgElem != null) {
+            val style = bgElem.attr("style")
+            val bgUrl = Regex("""url\(['"]?([^'"\)]+)['"]?\)""").find(style)?.groupValues?.get(1)
+            if (!bgUrl.isNullOrEmpty() && !bgUrl.contains("logo") && !bgUrl.contains("clickonserver")) {
+                return fixUrlNull(bgUrl)
+            }
+        }
+
+        return null
+    }
+
     private fun parseCardElement(element: Element): SearchResponse? {
         val targetLink = if (element.tagName() == "a") {
             element
@@ -45,12 +87,22 @@ class ExYuTeka : MainAPI() {
         if (href == mainUrl || href == "$mainUrl/" || href.endsWith(".php") || href.endsWith("#")) return null
 
         val img = element.selectFirst("img") ?: targetLink.selectFirst("img") ?: element.parent()?.selectFirst("img")
-        val posterUrl = fixUrlNull(
+        var posterUrl = fixUrlNull(
             img?.attr("data-src")?.ifEmpty { null }
                 ?: img?.attr("data-lazy-src")?.ifEmpty { null }
                 ?: img?.attr("data-original")?.ifEmpty { null }
                 ?: img?.attr("src")?.ifEmpty { null }
         )
+
+        if (posterUrl == null) {
+            val bgStyle = element.selectFirst("[style*='background']")?.attr("style")
+                ?: targetLink.selectFirst("[style*='background']")?.attr("style")
+            val bgMatch = bgStyle?.let { Regex("""url\(['"]?([^'"\)]+)['"]?\)""").find(it)?.groupValues?.get(1) }
+            if (!bgMatch.isNullOrEmpty()) {
+                posterUrl = fixUrlNull(bgMatch)
+            }
+        }
+
         if (posterUrl != null && posterUrl.contains("logo") && !posterUrl.contains("slika")) return null
 
         val seriesName = element.selectFirst(".ep-series")?.text()?.trim()
@@ -161,10 +213,7 @@ class ExYuTeka : MainAPI() {
         }
 
         val title = document.selectFirst(".single-title, h1, .title")?.text()?.trim() ?: "ExYuTeka"
-        val posterUrl = fixUrlNull(
-            document.selectFirst(".single-poster img, .poster img, img[src*='/slika']")?.attr("data-src")
-                ?: document.selectFirst(".single-poster img, .poster img, img[src*='/slika']")?.attr("src")
-        )
+        val posterUrl = extractPoster(document)
         val plot = document.selectFirst(".single-desc, .description, p")?.text()?.trim()
         val year = document.selectFirst(".single-meta")?.text()?.let {
             Regex("""\b(19\d{2}|20\d{2})\b""").find(it)?.value?.toIntOrNull()
@@ -192,12 +241,19 @@ class ExYuTeka : MainAPI() {
                             ?: Regex("""[eE]pizoda\s*(\d+)""").find(epTitleText)?.groupValues?.get(1)?.toIntOrNull()
                             ?: (eIndex + 1)
 
+                        val epImg = epElem.selectFirst("img")
+                        val epPoster = fixUrlNull(
+                            epImg?.attr("data-src")?.ifEmpty { null }
+                                ?: epImg?.attr("data-lazy-src")?.ifEmpty { null }
+                                ?: epImg?.attr("src")?.ifEmpty { null }
+                        ) ?: posterUrl
+
                         episodes.add(
                             newEpisode(epHref) {
                                 this.name = "Epizoda $episodeNum"
                                 this.season = seasonNum
                                 this.episode = episodeNum
-                                this.posterUrl = posterUrl
+                                this.posterUrl = epPoster
                             }
                         )
                     }
@@ -215,12 +271,19 @@ class ExYuTeka : MainAPI() {
                         ?: Regex("""[eE]pizoda\s*(\d+)""").find(epText)?.groupValues?.get(1)?.toIntOrNull()
                         ?: (index + 1)
 
+                    val epImg = epElem.selectFirst("img")
+                    val epPoster = fixUrlNull(
+                        epImg?.attr("data-src")?.ifEmpty { null }
+                            ?: epImg?.attr("data-lazy-src")?.ifEmpty { null }
+                            ?: epImg?.attr("src")?.ifEmpty { null }
+                    ) ?: posterUrl
+
                     episodes.add(
                         newEpisode(epHref) {
                             this.name = "Epizoda $eNum"
                             this.season = sNum
                             this.episode = eNum
-                            this.posterUrl = posterUrl
+                            this.posterUrl = epPoster
                         }
                     )
                 }
@@ -255,7 +318,6 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         val streamUrl = fixUrl(rawUrl.replace("\\/", "/").trim())
 
-        // Blockiert Webseiten, Scripts und Bild-Assets (verhindert Code 3003)
         if (streamUrl.isEmpty() || streamUrl.contains(".php") || streamUrl.contains("/watch") ||
             streamUrl.contains("/embed") || streamUrl.endsWith(".jpg") || streamUrl.endsWith(".png") ||
             streamUrl.endsWith(".js") || streamUrl.endsWith(".css") || streamUrl.endsWith(".svg")
@@ -295,16 +357,13 @@ class ExYuTeka : MainAPI() {
     ) {
         val cleanUrl = url.trim()
 
-        // Abyss-Domains konsequent überspringen (nicht abspielbare Fragmente)
         if (cleanUrl.contains("abyss") || cleanUrl.contains("sssrr.org")) return
 
-        // 1. SERVER EXYU (yustream.org Direkt-MP4 1080p)
         if (cleanUrl.contains("yustream.org") && (cleanUrl.endsWith(".mp4") || cleanUrl.contains("/uploads/"))) {
             addStreamLink(cleanUrl, referer, "Server EXYU", emittedStreams, callback, Qualities.P1080)
             return
         }
 
-        // 2. SERVER VIDHIDE (callistanise.com / vidhide)
         if (cleanUrl.contains("callistanise") || cleanUrl.contains("vidhide")) {
             val id = Regex("""/([a-zA-Z0-9_-]{6,})""").find(cleanUrl.substringAfterLast("/"))?.groupValues?.get(1)
                 ?: cleanUrl.substringAfterLast("/").substringBefore("?")
@@ -319,7 +378,6 @@ class ExYuTeka : MainAPI() {
             return
         }
 
-        // 3. SERVER FILEMOON / BYSE (n1mwq.org / filemoon)
         if (cleanUrl.contains("n1mwq") || cleanUrl.contains("filemoon") || cleanUrl.contains("byse")) {
             val id = Regex("""/([a-zA-Z0-9_-]{6,})""").find(cleanUrl.substringAfterLast("/"))?.groupValues?.get(1)
                 ?: cleanUrl.substringAfterLast("/").substringBefore("?")
@@ -334,7 +392,6 @@ class ExYuTeka : MainAPI() {
             return
         }
 
-        // 4. STREAMTAPE
         if (cleanUrl.contains("streamtape")) {
             try {
                 loadExtractor(cleanUrl, referer, subtitleCallback, callback)
@@ -384,7 +441,6 @@ class ExYuTeka : MainAPI() {
         val mainDoc = mainResponse.document
         val mainHtml = mainResponse.text
 
-        // 1. Iframe- und Frame-URLs einsammeln
         val framesToScan = mutableSetOf<String>()
 
         mainDoc.select("iframe, [data-src], [data-url], [data-embed]").forEach { elem ->
@@ -416,7 +472,6 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // 2. DSSERVER LADEN (Direkt über den Slug aus dem Iframe)
         val allSlugs = mutableSetOf<String>()
         for (u in framesToScan) {
             val slugMatch = Regex("""[?&]search=([^&]+)""").find(u)?.groupValues?.get(1)
@@ -465,7 +520,6 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // 3. ALLE SRO- UND PLAYER-FRAMES DURCHSUCHEN
         for (frameUrl in framesToScan) {
             if (!visitedUrls.add(frameUrl)) continue
 
@@ -495,7 +549,6 @@ class ExYuTeka : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // 4. DIREKTE HOSTER-LINKS AUF DER HAUPTSEITE PRÜFEN
         for (eu in parseServerUrlsFromCode(mainHtml)) {
             handleExtractedServerUrl(eu, data, emittedStreams, subtitleCallback, callback)
         }
