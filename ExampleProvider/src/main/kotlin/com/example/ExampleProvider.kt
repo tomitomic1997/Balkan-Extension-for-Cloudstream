@@ -260,7 +260,7 @@ class ExYuTeka : MainAPI() {
         }
     }
 
-    private fun addDsStreamLink(
+    private suspend fun addDsStreamLink(
         streamUrl: String,
         emittedStreams: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
@@ -286,7 +286,7 @@ class ExYuTeka : MainAPI() {
         return false
     }
 
-    private fun findAndAddDsStream(
+    private suspend fun findAndAddDsStream(
         html: String,
         doc: Document,
         emittedStreams: MutableSet<String>,
