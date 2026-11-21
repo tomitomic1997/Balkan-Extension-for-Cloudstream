@@ -8,7 +8,12 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.math.BigInteger
 import java.net.URLEncoder
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.Signature
+import java.security.interfaces.ECPublicKey
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -27,8 +32,23 @@ class ExYuTeka : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
+    // Fester UA für alle Byse-API-Calls (Attest-Cache ist UA-gebunden)
+    private val byseUA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+    private val embedOrigin = "exyuteka.net"
+
     private fun dbg(msg: String) {
         Log.d("ExYuTeka", msg)
+    }
+
+    // ---------------- Attest-Cache (10 Minuten pro Host) ----------------
+    private class AttestCache(
+        val token: String, val viewerId: String, val deviceId: String,
+        val confidence: Double, val ts: Long
+    )
+
+    companion object {
+        private val attestCache = mutableMapOf<String, AttestCache>()
     }
 
     override val mainPage = mainPageOf(
@@ -294,7 +314,6 @@ class ExYuTeka : MainAPI() {
         } catch (_: Exception) { plain }
     }
 
-    /** Liest die Server-URLs aus der JavaScript-Switch-Funktion (case N: src = "...") */
     private fun extractServerUrls(html: String): List<String> {
         val out = linkedSetOf<String>()
         Regex("""case\s+\d+\s*:\s*src\s*=\s*["']([^"']+)["']""").findAll(html).forEach {
@@ -327,7 +346,6 @@ class ExYuTeka : MainAPI() {
         return out.filterNot { isJunk(it) }.toSet()
     }
 
-    /** Findet direkte mp4/m3u8-Links (auch in entpacktem JWPlayer-Code) */
     private suspend fun directVideos(
         doc: Document, rawHtml: String, pageUrl: String, label: String,
         emitted: MutableSet<String>, callback: (ExtractorLink) -> Unit
@@ -377,7 +395,9 @@ class ExYuTeka : MainAPI() {
         return found
     }
 
-    // ------------------------------------------- Byse (ehemals Filemoon), eigener AES-Extractor
+    // ==================================================================
+    //  BYSE / FILEMOON ENGINE (Challenge-Flow, Port von docchi-players)
+    // ==================================================================
 
     private fun b64UrlDecode(s: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
@@ -385,66 +405,408 @@ class ExYuTeka : MainAPI() {
         return Base64.decode(fixed + "=".repeat(pad), Base64.DEFAULT)
     }
 
+    private fun b64UrlEncode(bytes: ByteArray): String =
+        Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+
+    private fun big32(v: BigInteger): ByteArray {
+        val raw = v.toByteArray()
+        return when {
+            raw.size == 33 && raw[0] == 0.toByte() -> raw.copyOfRange(1, 33)
+            raw.size > 32 -> raw.copyOfRange(raw.size - 32, raw.size)
+            raw.size < 32 -> ByteArray(32 - raw.size) + raw
+            else -> raw
+        }
+    }
+
+    // ---------- Proof-of-Work Solver (1:1 aus pow_solver.c) ----------
+
+    private fun rl(v: Int, s: Int): Int = (v shl s) or (v ushr (32 - s))
+
+    private fun quarter(st: IntArray) {
+        st[0] += st[1]; st[3] = rl(st[3] xor st[0], 16)
+        st[2] += st[3]; st[1] = rl(st[1] xor st[2], 12)
+        st[0] += st[1]; st[3] = rl(st[3] xor st[0], 8)
+        st[2] += st[3]; st[1] = rl(st[1] xor st[2], 7)
+    }
+
+    private fun powSingle(input: ByteArray, difficulty: Int): Boolean {
+        val initConst = 2654435761L.toInt()
+        val finalConst = 2246822519L.toInt()
+        val st = IntArray(4)
+        st[0] = 1779033703; st[1] = 3144134277L.toInt(); st[2] = 1013904242; st[3] = 2773480762L.toInt()
+
+        for (b in input) {
+            st[0] += b.toInt() and 0xFF
+            st[0] = rl(st[0], 7)
+            quarter(st)
+        }
+        repeat(8) { quarter(st) }
+
+        val buf = IntArray(512)
+        for (i in 0 until 512) {
+            quarter(st)
+            buf[i] = st[0] xor st[2]
+        }
+        repeat(2) {
+            for (s in 0 until 512) {
+                val a = buf[s] and 511
+                var c = buf[s] + buf[a]
+                c = rl(c, 13)
+                c = c xor ((buf[(s + 1) and 511].toLong() * initConst).toInt())
+                buf[s] = c
+                st[0] = st[0] xor c
+                quarter(st)
+            }
+        }
+
+        quarter(st)
+        var out = st[0]
+        for (c in 0 until 64) {
+            val d = buf[c]
+            out += d
+            out = rl(out, 5)
+            out = out xor ((d.toLong() * finalConst).toInt())
+        }
+        out = out xor st[2]
+
+        var leading = Integer.numberOfLeadingZeros(out)
+        if (difficulty <= 32) return leading >= difficulty
+        if (leading < 32) return false
+
+        var total = leading
+        var remaining = difficulty - 32
+        for (i in 1 until 8) {
+            if (remaining <= 0) break
+            quarter(st)
+            var v = st[0]
+            val base = i * 64
+            for (c in 0 until 64) {
+                val d = buf[base + c]
+                v += d
+                v = rl(v, 5)
+                v = v xor ((d.toLong() * finalConst).toInt())
+            }
+            v = v xor st[2]
+            val lz = Integer.numberOfLeadingZeros(v)
+            total += lz
+            if (lz < 32) break
+            remaining -= 32
+        }
+        return total >= difficulty
+    }
+
+    private fun powSolve(nonce: String, difficulty: Int, maxIter: Int = 500000): String? {
+        val prefix = (nonce + ":").toByteArray(Charsets.ISO_8859_1)
+        for (counter in 0 until maxIter) {
+            val cb = counter.toString().toByteArray(Charsets.ISO_8859_1)
+            val input = ByteArray(prefix.size + cb.size)
+            System.arraycopy(prefix, 0, input, 0, prefix.size)
+            System.arraycopy(cb, 0, input, prefix.size, cb.size)
+            if (powSingle(input, difficulty)) return counter.toString()
+        }
+        return null
+    }
+
+    // ---------- HTTP-Helfer für die Byse-API ----------
+
+    private fun jStr(json: String, key: String): String? =
+        Regex(""""$key"\s*:\s*"([^"]*)"""").find(json)?.groupValues?.get(1)
+
+    private suspend fun byseGet(url: String, host: String, extra: Map<String, String> = emptyMap()): String? =
+        try {
+            app.get(
+                url,
+                headers = mapOf(
+                    "User-Agent" to byseUA,
+                    "Accept" to "*/*",
+                    "Referer" to "https://$host/",
+                    "Origin" to "https://$host"
+                ) + extra
+            ).text
+        } catch (e: Exception) {
+            dbg("BYSE GET Fehler $url: ${e.message}")
+            null
+        }
+
+    private suspend fun bysePost(
+        url: String, payload: Map<String, Any?>,
+        headers: Map<String, String>
+    ): String? =
+        try {
+            app.post(url, headers = headers, json = payload).text
+        } catch (e: Exception) {
+            dbg("BYSE POST Fehler $url: ${e.message}")
+            null
+        }
+
+    private fun clientFingerprint(): Map<String, Any?> {
+        val widths = listOf(1920, 2560, 1366, 1440, 1680)
+        val heights = listOf(1080, 1440, 768, 900, 1050)
+        val i = (Math.random() * widths.size).toInt().coerceIn(0, widths.size - 1)
+        fun randHash() = b64UrlEncode(ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })
+        return mapOf(
+            "user_agent" to byseUA,
+            "pixel_ratio" to listOf(1, 2).random(),
+            "screen_width" to widths[i],
+            "screen_height" to heights[i],
+            "color_depth" to 24,
+            "languages" to listOf("en-US", "en"),
+            "timezone" to "Europe/Belgrade",
+            "hardware_concurrency" to listOf(4, 8, 12, 16).random(),
+            "touch_points" to 0,
+            "webgl_vendor" to "Intel",
+            "webgl_renderer" to "Intel(R) HD Graphics, or similar",
+            "canvas_hash" to randHash(),
+            "audio_hash" to randHash(),
+            "webgl_params_hash" to randHash(),
+            "fonts_hash" to randHash(),
+            "codecs_hash" to randHash(),
+            "media_devices" to "ai0ao0vi0",
+            "pointer_type" to "fine,hover",
+            "extra" to mapOf("vendor" to "", "appVersion" to "5.0 (Windows NT 10.0)")
+        )
+    }
+
+    private fun legacyFingerprint(): Map<String, Any?> {
+        val vId = (0 until 32).map { "0123456789abcdef".random() }.joinToString("")
+        val dId = (0 until 32).map { "0123456789abcdef".random() }.joinToString("")
+        val ctime = System.currentTimeMillis() / 1000
+        val conf = Math.round((0.6 + Math.random() * 0.3) * 100) / 100.0
+        val tData = mutableMapOf<String, Any?>(
+            "viewer_id" to vId, "device_id" to dId, "confidence" to conf,
+            "iat" to ctime, "exp" to ctime + 600
+        )
+        val json = tData.entries.joinToString(",", "{", "}") { """"${it.key}":${jsonVal(it.value)}""" }
+        val bdata = b64UrlEncode(json.toByteArray())
+        val sig = b64UrlEncode(MessageDigest.getInstance("SHA-256").digest(bdata.toByteArray()))
+        val token = "$bdata.$sig"
+        tData.remove("iat"); tData.remove("exp")
+        tData["token"] = token
+        return mapOf("fingerprint" to tData)
+    }
+
+    private fun jsonVal(v: Any?): String = when (v) {
+        null -> "null"
+        is String -> "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        is Boolean -> v.toString()
+        is Double -> v.toString()
+        is Long -> v.toString()
+        is Int -> v.toString()
+        else -> "\"" + v.toString() + "\""
+    }
+
+    /** 5-Stufen-Challenge: challenge -> attest -> captcha(PoW) -> verify -> playback */
+    private suspend fun challengePlayback(
+        host: String, code: String, prefix: String, embedUrl: String
+    ): String? {
+        val apiHeaders = mapOf(
+            "User-Agent" to byseUA,
+            "Accept" to "*/*",
+            "Referer" to "https://$embedOrigin/",
+            "Origin" to "https://$host"
+        )
+        val embedExtra = mapOf(
+            "X-Embed-Origin" to embedOrigin,
+            "X-Embed-Referer" to "https://$embedOrigin/",
+            "X-Embed-Parent" to embedUrl
+        )
+
+        var token: String?
+        var viewerId: String?
+        var deviceId: String?
+        var confidence: Double
+
+        val cached = attestCache[host]?.takeIf { System.currentTimeMillis() - it.ts < 600_000 }
+        if (cached != null) {
+            token = cached.token; viewerId = cached.viewerId
+            deviceId = cached.deviceId; confidence = cached.confidence
+            dbg("BYSE attest cache für $host")
+        } else {
+            val challenge = bysePost(
+                "https://$host/api/videos/access/challenge",
+                emptyMap(), apiHeaders
+            ) ?: return null
+            val challengeId = jStr(challenge, "challenge_id") ?: return null
+            val nonce = jStr(challenge, "nonce") ?: return null
+            dbg("BYSE challenge ok")
+
+            // ECDSA P-256 Keypair + Signatur
+            val kpg = KeyPairGenerator.getInstance("EC")
+            kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
+            val kp = kpg.generateKeyPair()
+            val signer = Signature.getInstance("SHA256withECDSA")
+            signer.initSign(kp.private)
+            signer.update(nonce.toByteArray())
+            val signature = b64UrlEncode(signer.sign())
+            val pub = kp.public as ECPublicKey
+            val jwk = mapOf(
+                "alg" to "ES256", "crv" to "P-256", "ext" to true,
+                "key_ops" to listOf("verify"), "kty" to "EC",
+                "x" to b64UrlEncode(big32(pub.w.affineX)),
+                "y" to b64UrlEncode(big32(pub.w.affineY))
+            )
+
+            val attest = bysePost(
+                "https://$host/api/videos/access/attest",
+                mapOf(
+                    "viewer_id" to "", "device_id" to "",
+                    "challenge_id" to challengeId, "nonce" to nonce,
+                    "signature" to signature, "public_key" to jwk,
+                    "client" to clientFingerprint(),
+                    "storage" to emptyMap<String, String>(),
+                    "attributes" to mapOf("entropy" to "low")
+                ),
+                apiHeaders
+            ) ?: return null
+            token = jStr(attest, "token") ?: return null
+            viewerId = jStr(attest, "viewer_id") ?: ""
+            deviceId = jStr(attest, "device_id") ?: ""
+            confidence = Regex(""""confidence"\s*:\s*([0-9.]+)""").find(attest)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.8
+            attestCache[host] = AttestCache(token, viewerId, deviceId, confidence, System.currentTimeMillis())
+            dbg("BYSE attest ok")
+        }
+
+        val cookie = "byse_viewer_id=$viewerId; byse_device_id=$deviceId"
+        val fpPayload = mapOf(
+            "fingerprint" to mapOf(
+                "token" to token, "viewer_id" to viewerId,
+                "device_id" to deviceId, "confidence" to confidence
+            )
+        )
+        val flowHeaders = apiHeaders + embedExtra + ("Cookie" to cookie)
+
+        val captcha = bysePost(
+            "https://$host/api/videos/$code/${prefix}captcha", fpPayload, flowHeaders
+        ) ?: return null
+        val powNonce = jStr(captcha, "pow_nonce") ?: return null
+        val powDifficulty = Regex(""""pow_difficulty"\s*:\s*(\d+)""").find(captcha)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val powToken = jStr(captcha, "pow_token") ?: return null
+        dbg("BYSE captcha: difficulty=$powDifficulty")
+
+        val t0 = System.currentTimeMillis()
+        val solution = powSolve(powNonce, powDifficulty) ?: return null
+        dbg("BYSE PoW gelöst in ${System.currentTimeMillis() - t0}ms")
+
+        val verify = bysePost(
+            "https://$host/api/videos/$code/${prefix}captcha/verify",
+            mapOf(
+                "pow_token" to powToken,
+                "solution" to solution,
+                "fingerprint" to fpPayload["fingerprint"]
+            ),
+            flowHeaders
+        ) ?: return null
+        if (jStr(verify, "status") != "ok") {
+            val captchaTokenAlt = jStr(verify, "token")
+            if (captchaTokenAlt == null) {
+                dbg("BYSE verify fehlgeschlagen: ${verify.take(120)}")
+                attestCache.remove(host)
+                return null
+            }
+        }
+        val captchaToken = jStr(verify, "token") ?: return null
+        dbg("BYSE verify ok")
+
+        return bysePost(
+            "https://$host/api/videos/$code/${prefix}playback",
+            fpPayload,
+            flowHeaders + ("X-Captcha-Token" to captchaToken)
+        )
+    }
+
+    /** Legacy-Pfad: POST playback mit selbstsigniertem Fingerprint */
+    private suspend fun legacyPlayback(host: String, code: String, prefix: String): String? =
+        bysePost(
+            "https://$host/api/videos/$code/${prefix}playback",
+            legacyFingerprint(),
+            mapOf(
+                "User-Agent" to byseUA,
+                "Accept" to "*/*",
+                "Referer" to "https://$host/",
+                "Origin" to "https://$host"
+            )
+        )
+
     private suspend fun parseByse(
         embedUrl: String,
         emitted: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (!embedUrl.startsWith("http")) return false
-        val base = urlBase(embedUrl)
         val code = urlCode(embedUrl)
         if (code.length < 4) return false
+        var host = urlBase(embedUrl).substringAfter("//")
 
-        dbg("BYSE: $embedUrl")
+        dbg("BYSE start: $embedUrl")
         try {
-            val detailsText = app.get(
-                "$base/api/videos/$code/embed/details",
-                headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")
-            ).text.replace("\\/", "/")
-            dbg("BYSE details: ${detailsText.take(160)}")
+            var prefix = "embed/"
+            var details = byseGet("https://$host/api/videos/$code/${prefix}details", host)
+            if (details == null || !details.contains("embed_frame_url") && details.contains("error")) {
+                details = byseGet("https://$host/api/videos/$code/details", host)
+                prefix = ""
+            }
+            if (details == null) return false
 
-            val frameUrl = Regex(""""embed_frame_url"\s*:\s*"([^"]+)"""")
-                .find(detailsText)?.groupValues?.get(1) ?: return false
+            val frameUrl = jStr(details, "embed_frame_url")
+            if (!frameUrl.isNullOrEmpty()) {
+                val fHost = urlBase(frameUrl).substringAfter("//")
+                if (fHost.isNotEmpty()) host = fHost
+            }
+            dbg("BYSE details ok, host=$host")
 
-            val embedBase = urlBase(frameUrl)
-            val embedCode = urlCode(frameUrl)
+            val settings = byseGet("https://$host/api/videos/$code/${prefix}settings", host)
+            val captchaRequired = settings != null &&
+                    Regex(""""captcha_required"\s*:\s*true""").containsMatchIn(settings)
+            dbg("BYSE captcha_required=$captchaRequired")
 
-            val pbText = app.get(
-                "$embedBase/api/videos/$embedCode/embed/playback",
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "accept" to "*/*",
-                    "referer" to frameUrl,
-                    "x-embed-parent" to embedUrl
+            val playback = if (captchaRequired) {
+                challengePlayback(host, code, prefix, embedUrl)
+            } else {
+                legacyPlayback(host, code, prefix)
+                    ?: challengePlayback(host, code, prefix, embedUrl)
+            }
+            if (playback == null) {
+                dbg("BYSE playback leer")
+                return false
+            }
+
+            // Quellen: entweder plain "sources" oder verschlüsseltes "playback"
+            var sourcesJson = playback
+            if (playback.contains("\"playback\"")) {
+                val pb = Regex(""""playback"\s*:\s*\{.*\}\s*\}?\s*$""", RegexOption.DOT_MATCHES_ALL)
+                    .find(playback)?.value ?: playback
+                val ivStr = jStr(pb, "iv") ?: return false
+                val payloadStr = jStr(pb, "payload") ?: return false
+                val partsBlock = Regex(""""key_parts"\s*:\s*\[([^\]]*)\]""").find(pb)?.groupValues?.get(1)
+                    ?: return false
+                var parts = Regex(""""([^"]+)"""").findAll(partsBlock).map { it.groupValues[1] }.toList()
+                val version = Regex(""""version"\s*:\s*(\d+)""").find(pb)?.groupValues?.get(1)?.toIntOrNull()
+                if (version != null && parts.size >= 2) {
+                    val v = version
+                    parts = listOf(parts[v - 1], parts[parts.size - v])
+                }
+                if (parts.size < 2) return false
+
+                val keyBytes = b64UrlDecode(parts[0]) + b64UrlDecode(parts[1])
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(
+                    Cipher.DECRYPT_MODE,
+                    SecretKeySpec(keyBytes, "AES"),
+                    GCMParameterSpec(128, b64UrlDecode(ivStr))
                 )
-            ).text
-
-            val partsBlock = Regex(""""key_parts"\s*:\s*\[([^\]]*)\]""").find(pbText)?.groupValues?.get(1)
-                ?: return false
-            val parts = Regex(""""([^"]+)"""").findAll(partsBlock).map { it.groupValues[1] }.toList()
-            if (parts.size < 2) return false
-            val ivStr = Regex(""""iv"\s*:\s*"([^"]+)"""").find(pbText)?.groupValues?.get(1) ?: return false
-            val payloadStr = Regex(""""payload"\s*:\s*"([^"]+)"""").find(pbText)?.groupValues?.get(1) ?: return false
-
-            val keyBytes = b64UrlDecode(parts[0]) + b64UrlDecode(parts[1])
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                SecretKeySpec(keyBytes, "AES"),
-                GCMParameterSpec(128, b64UrlDecode(ivStr))
-            )
-            val plain = cipher.doFinal(b64UrlDecode(payloadStr)).decodeToString()
-                .removePrefix("\uFEFF").replace("\\/", "/")
-            dbg("BYSE entschlüsselt: ${plain.length} Zeichen")
+                sourcesJson = cipher.doFinal(b64UrlDecode(payloadStr)).decodeToString()
+                    .removePrefix("\uFEFF").replace("\\/", "/")
+                dbg("BYSE entschlüsselt: ${sourcesJson.length} Zeichen")
+            }
 
             var found = false
-            Regex("""\{[^{}]*\}""").findAll(plain).forEach { m ->
+            Regex("""\{[^{}]*\}""").findAll(sourcesJson).forEach { m ->
                 val obj = m.value
-                val u = Regex(""""url"\s*:\s*"([^"]+)"""").find(obj)?.groupValues?.get(1) ?: return@forEach
+                val u = jStr(obj, "url") ?: return@forEach
                 if (!u.startsWith("http")) return@forEach
                 if (!emitted.add(u)) return@forEach
                 val h = Regex(""""height"\s*:\s*(\d+)""").find(obj)?.groupValues?.get(1)?.toIntOrNull()
-                val lbl = Regex(""""label"\s*:\s*"([^"]+)"""").find(obj)?.groupValues?.get(1)
+                val lbl = jStr(obj, "label")
                 val isM3u8 = u.contains(".m3u8") || obj.contains("mpegurl", true) || obj.contains("hls", true)
 
                 dbg("BYSE LINK: $u")
@@ -454,9 +816,9 @@ class ExYuTeka : MainAPI() {
                     url = u,
                     type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = "$embedBase/"
+                    this.referer = "https://$host/"
                     this.quality = h ?: Qualities.P1080.value
-                    this.headers = mapOf("Referer" to "$embedBase/", "User-Agent" to userAgent)
+                    this.headers = mapOf("Referer" to "https://$host/", "User-Agent" to byseUA)
                 })
                 found = true
             }
@@ -466,6 +828,8 @@ class ExYuTeka : MainAPI() {
             return false
         }
     }
+
+    // ==================================================================
 
     private suspend fun renameLink(link: ExtractorLink, label: String): ExtractorLink =
         newExtractorLink(
@@ -480,7 +844,6 @@ class ExYuTeka : MainAPI() {
             this.extractorData = link.extractorData
         }
 
-    /** Generischer Scraper: holt die Seite, entpackt JWPlayer, folgt iframes (1 Ebene) */
     private suspend fun genericMedia(
         url: String, referer: String, label: String,
         visited: MutableSet<String>, emitted: MutableSet<String>,
@@ -525,7 +888,6 @@ class ExYuTeka : MainAPI() {
         return ok
     }
 
-    /** Behandelt eine Server-URL aus dem Switch: DSServer / Byse / Extractor / generisch */
     private suspend fun handleServer(
         url: String, referer: String, label: String,
         visited: MutableSet<String>, emitted: MutableSet<String>,
@@ -576,7 +938,6 @@ class ExYuTeka : MainAPI() {
         val serverUrls = linkedSetOf<String>()
         serverUrls.addAll(extractServerUrls(page.text))
 
-        // Player-Frames (sro*.php) holen und deren Switch auslesen
         val mainCands = collectCandidates(page.document, page.text)
         mainCands.filter { isOwnSite(it) && it != data && (it.contains(".php") || it.contains("/embed")) }
             .take(6)
@@ -596,12 +957,10 @@ class ExYuTeka : MainAPI() {
         dbg("SERVERLISTE (${serverUrls.size}):")
         serverUrls.forEach { dbg("  -> $it") }
 
-        // Alle Server verarbeiten
         serverUrls.forEach { u ->
             handleServer(u, data, "$name - ${urlBase(u).substringAfter("//").substringBefore(".")}", visited, emitted, subtitleCallback, wrapped)
         }
 
-        // Fallback: DSPlayer-Slugs, falls bisher nichts gefunden
         if (!foundAny && emitted.isEmpty()) {
             val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
             val slugs = mutableSetOf<String>()
