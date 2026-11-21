@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLEncoder
 
 class ExYuTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
@@ -131,20 +132,50 @@ class ExYuTeka : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val searchUrls = listOf(
-            "$mainUrl/pretraga.php?q=${query.replace(" ", "+")}",
-            "$mainUrl/?s=${query.replace(" ", "+")}"
+        val q = query.trim().lowercase()
+        
+        // Abfangen von Kategorie-Suchen (User tippen oft "film" oder "serien" ins Suchfeld)
+        val categoryMap = mapOf(
+            "serije" to "$mainUrl/serije.php",
+            "serien" to "$mainUrl/serije.php",
+            "series" to "$mainUrl/serije.php",
+            "film" to "$mainUrl/filmovi.php",
+            "filmovi" to "$mainUrl/filmovi.php",
+            "movies" to "$mainUrl/filmovi.php",
+            "crtaci" to "$mainUrl/crtaci.php",
+            "sinhronizovani" to "$mainUrl/sinhronizovani.php",
+            "dokumentarne" to "$mainUrl/dokumentarne.php",
+            "latino" to "$mainUrl/latino.php",
+            "korejske" to "$mainUrl/korejske.php",
+            "rijaliti" to "$mainUrl/rijaliti.php",
+            "nove epizode" to "$mainUrl/nove-epizode.php",
+            "nove" to "$mainUrl/nove-epizode.php"
         )
 
-        for (url in searchUrls) {
-            try {
-                val document = app.get(url, headers = headers).document
-                val results = parseCards(document)
-                if (results.isNotEmpty()) {
-                    return results
-                }
-            } catch (_: Exception) {}
+        for ((keyword, url) in categoryMap) {
+            if (q == keyword || q.contains(keyword)) {
+                try {
+                    val document = app.get(url, headers = headers).document
+                    val results = parseCards(document)
+                    if (results.isNotEmpty()) {
+                        return results
+                    }
+                } catch (_: Exception) {}
+            }
         }
+
+        // Normale Suche mit korrektem URL-Encoding für Sonderzeichen (č, ć, š, ž, đ)
+        val encodedQuery = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
+        val searchUrl = "$mainUrl/pretraga.php?q=$encodedQuery"
+        
+        try {
+            val document = app.get(searchUrl, headers = headers).document
+            val results = parseCards(document)
+            if (results.isNotEmpty()) {
+                return results
+            }
+        } catch (_: Exception) {}
+
         return emptyList()
     }
 
