@@ -2,8 +2,11 @@
 
 package com.example
 
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
-import android.util.Log
+import android.widget.Toast
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -38,8 +41,14 @@ class ExYuTeka : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
     private val embedOrigin = "exyuteka.net"
 
-    private fun dbg(msg: String) {
-        Log.d("ExYuTeka", msg)
+    // Toast-Helfer: zeigt Meldungen direkt auf dem Bildschirm
+    private fun toast(msg: String) {
+        try {
+            val ctx: Context = app.context
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(ctx, "ExYuTeka: $msg", Toast.LENGTH_LONG).show()
+            }
+        } catch (_: Exception) {}
     }
 
     private class AttestCache(
@@ -382,7 +391,6 @@ class ExYuTeka : MainAPI() {
                 u.contains("480") -> Qualities.P480.value
                 else -> Qualities.P1080.value
             }
-            dbg("DIRECT VIDEO: $u")
             callback(newExtractorLink(
                 source = this.name, name = label, url = u,
                 type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -532,7 +540,7 @@ class ExYuTeka : MainAPI() {
                 )
             ).text
         } catch (e: Exception) {
-            dbg("BYSE GET Fehler $url: ${e.message}")
+            toast("BYSE GET Fehler: ${e.message?.take(40)}")
             null
         }
 
@@ -544,7 +552,7 @@ class ExYuTeka : MainAPI() {
                 requestBody = toJson(payload).toRequestBody("application/json".toMediaTypeOrNull())
             ).text
         } catch (e: Exception) {
-            dbg("BYSE POST Fehler $url: ${e.message}")
+            toast("BYSE POST Fehler: ${e.message?.take(40)}")
             null
         }
 
@@ -616,13 +624,13 @@ class ExYuTeka : MainAPI() {
         if (cached != null) {
             token = cached.token; viewerId = cached.viewerId
             deviceId = cached.deviceId; confidence = cached.confidence
-            dbg("BYSE attest cache für $host")
+            toast("BYSE cache OK")
         } else {
             val challenge = bysePost("https://$host/api/videos/access/challenge", emptyMap(), apiHeaders)
                 ?: return null
             val challengeId = jStr(challenge, "challenge_id") ?: return null
             val nonce = jStr(challenge, "nonce") ?: return null
-            dbg("BYSE challenge ok")
+            toast("BYSE challenge OK")
 
             val kpg = KeyPairGenerator.getInstance("EC")
             kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
@@ -657,7 +665,7 @@ class ExYuTeka : MainAPI() {
             val c = Regex(""""confidence"\s*:\s*([0-9.]+)""").find(attest)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.8
             attestCache[host] = AttestCache(t, v, d, c, System.currentTimeMillis())
             token = t; viewerId = v; deviceId = d; confidence = c
-            dbg("BYSE attest ok")
+            toast("BYSE attest OK")
         }
 
         val cookie = "byse_viewer_id=$viewerId; byse_device_id=$deviceId"
@@ -675,11 +683,14 @@ class ExYuTeka : MainAPI() {
         val powDifficulty = Regex(""""pow_difficulty"\s*:\s*(\d+)""").find(captcha)?.groupValues?.get(1)?.toIntOrNull()
             ?: return null
         val powToken = jStr(captcha, "pow_token") ?: return null
-        dbg("BYSE captcha: difficulty=$powDifficulty")
+        toast("BYSE captcha diff=$powDifficulty")
 
         val t0 = System.currentTimeMillis()
-        val solution = powSolve(powNonce, powDifficulty) ?: return null
-        dbg("BYSE PoW gelöst in ${System.currentTimeMillis() - t0}ms")
+        val solution = powSolve(powNonce, powDifficulty) ?: run {
+            toast("BYSE PoW FEHLER")
+            return null
+        }
+        toast("BYSE PoW ${System.currentTimeMillis() - t0}ms")
 
         val verify = bysePost(
             "https://$host/api/videos/$code/${prefix}captcha/verify",
@@ -692,11 +703,11 @@ class ExYuTeka : MainAPI() {
         ) ?: return null
         val captchaToken = jStr(verify, "token")
         if (captchaToken == null) {
-            dbg("BYSE verify fehlgeschlagen: ${verify.take(120)}")
+            toast("BYSE verify FAIL: ${verify.take(60)}")
             attestCache.remove(host)
             return null
         }
-        dbg("BYSE verify ok")
+        toast("BYSE verify OK")
 
         return bysePost(
             "https://$host/api/videos/$code/${prefix}playback",
@@ -727,7 +738,7 @@ class ExYuTeka : MainAPI() {
         if (code.length < 4) return false
         var host = urlBase(embedUrl).substringAfter("//")
 
-        dbg("BYSE start: $embedUrl")
+        toast("BYSE start: $host / $code")
         try {
             var prefix = "embed/"
             var details = byseGet("https://$host/api/videos/$code/${prefix}details", host)
@@ -735,19 +746,22 @@ class ExYuTeka : MainAPI() {
                 details = byseGet("https://$host/api/videos/$code/details", host)
                 prefix = ""
             }
-            if (details == null) return false
+            if (details == null) {
+                toast("BYSE details FAIL")
+                return false
+            }
 
             val frameUrl = jStr(details, "embed_frame_url")
             if (!frameUrl.isNullOrEmpty()) {
                 val fHost = urlBase(frameUrl).substringAfter("//")
                 if (fHost.isNotEmpty()) host = fHost
             }
-            dbg("BYSE details ok, host=$host")
+            toast("BYSE host=$host")
 
             val settings = byseGet("https://$host/api/videos/$code/${prefix}settings", host)
             val captchaRequired = settings != null &&
                     Regex(""""captcha_required"\s*:\s*true""").containsMatchIn(settings)
-            dbg("BYSE captcha_required=$captchaRequired")
+            toast("BYSE captcha=$captchaRequired")
 
             val playback = if (captchaRequired) {
                 challengePlayback(host, code, prefix, embedUrl)
@@ -756,7 +770,7 @@ class ExYuTeka : MainAPI() {
                     ?: challengePlayback(host, code, prefix, embedUrl)
             }
             if (playback == null) {
-                dbg("BYSE playback leer")
+                toast("BYSE playback leer")
                 return false
             }
 
@@ -785,7 +799,7 @@ class ExYuTeka : MainAPI() {
                 )
                 sourcesJson = cipher.doFinal(b64UrlDecode(payloadStr)).decodeToString()
                     .removePrefix("\uFEFF").replace("\\/", "/")
-                dbg("BYSE entschlüsselt: ${sourcesJson.length} Zeichen")
+                toast("BYSE entschlüsselt ${sourcesJson.length} Zeichen")
             }
 
             var found = false
@@ -798,7 +812,7 @@ class ExYuTeka : MainAPI() {
                 val lbl = jStr(obj, "label")
                 val isM3u8 = u.contains(".m3u8") || obj.contains("mpegurl", true) || obj.contains("hls", true)
 
-                dbg("BYSE LINK: $u")
+                toast("BYSE LINK: ${u.take(60)}")
                 callback(newExtractorLink(
                     source = this.name,
                     name = "$name - Byse" + (lbl?.let { " $it" } ?: h?.let { " ${it}p" } ?: ""),
@@ -813,7 +827,7 @@ class ExYuTeka : MainAPI() {
             }
             return found
         } catch (e: Exception) {
-            dbg("BYSE Fehler: ${e.message}")
+            toast("BYSE Fehler: ${e.message?.take(50)}")
             return false
         }
     }
@@ -841,12 +855,11 @@ class ExYuTeka : MainAPI() {
         var ok = false
         try {
             val resp = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
-            dbg("GENERIC ${resp.url} (${resp.text.length} Zeichen)")
+            toast("GENERIC ${urlBase(url).substringAfter("//")} (${resp.text.length} Zeichen)")
 
-            // NEU: externe URLs der Seite loggen (zeigt uns z.B. die Abys-API)
             val extern = collectCandidates(resp.document, resp.text)
                 .filterNot { isOwnSite(it) || it == url || it == resp.url }
-            dbg("GENERIC extern (${extern.size}): ${extern.take(8).joinToString(" | ")}")
+            toast("GENERIC extern: ${extern.take(4).joinToString(" | ")}")
 
             if (directVideos(resp.document, resp.text, url, label, emitted, callback)) ok = true
 
@@ -879,7 +892,7 @@ class ExYuTeka : MainAPI() {
                 if (parseByse(resp.url, emitted, callback)) ok = true
             }
         } catch (e: Exception) {
-            dbg("GENERIC Fehler $url: ${e.message}")
+            toast("GENERIC Fehler: ${e.message?.take(50)}")
         }
         return ok
     }
@@ -890,9 +903,8 @@ class ExYuTeka : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         if (isJunk(url)) return
-        dbg("SERVER: $url")
+        toast("SERVER: ${urlBase(url).substringAfter("//").substringBefore("/")}")
 
-        // DSServer: ERSTE funktionierende Variante gewinnt, keine Duplikate mehr
         if (url.contains("dsplayer.site")) {
             var dsOk = false
             val variants = listOf(
@@ -920,7 +932,7 @@ class ExYuTeka : MainAPI() {
         val collected = mutableListOf<ExtractorLink>()
         try { loadExtractor(url, referer, subtitleCallback) { collected.add(it) } } catch (_: Exception) {}
         if (collected.isNotEmpty()) {
-            dbg("EXTRACTOR OK: $url (${collected.size})")
+            toast("EXTRACTOR OK: ${collected.size}")
             collected.forEach { link -> callback(renameLink(link, label)) }
             return
         }
@@ -940,7 +952,7 @@ class ExYuTeka : MainAPI() {
         val wrapped: (ExtractorLink) -> Unit = { foundAny = true; callback(it) }
 
         try {
-            dbg("=== LOADLINKS: $data ===")
+            toast("Lade Server...")
             val page = app.get(data, headers = headers)
             val serverUrls = linkedSetOf<String>()
             serverUrls.addAll(extractServerUrls(page.text))
@@ -953,7 +965,6 @@ class ExYuTeka : MainAPI() {
                     runCatching {
                         val r = app.get(p, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
                         val found = extractServerUrls(r.text)
-                        dbg("FRAME $p -> ${found.size} Server")
                         serverUrls.addAll(found)
                         if (found.isEmpty()) {
                             serverUrls.addAll(collectCandidates(r.document, r.text).filterNot { isOwnSite(it) })
@@ -965,8 +976,7 @@ class ExYuTeka : MainAPI() {
                 serverUrls.addAll(mainCands.filterNot { isOwnSite(it) }.take(10))
             }
 
-            dbg("SERVERLISTE (${serverUrls.size}):")
-            serverUrls.forEach { dbg("  -> $it") }
+            toast("${serverUrls.size} Server gefunden")
 
             serverUrls.forEach { u ->
                 runCatching {
@@ -978,7 +988,6 @@ class ExYuTeka : MainAPI() {
                 }
             }
 
-            // DSServer-Slug-Fallback NUR wenn bisher kein DSServer-Link gefunden wurde
             if (emitted.none { it.contains("dsplayer") }) {
                 val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
                 val slugs = mutableSetOf<String>()
@@ -1005,10 +1014,10 @@ class ExYuTeka : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            dbg("LOADLINKS CRASH: ${e.message}")
+            toast("CRASH: ${e.message?.take(60)}")
         }
 
-        dbg("=== ENDE: foundAny=$foundAny emitted=${emitted.size} ===")
+        toast("Fertig: ${emitted.size} Links")
         return foundAny || emitted.isNotEmpty()
     }
 }
