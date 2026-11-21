@@ -5,7 +5,6 @@ package com.example
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.runBlocking
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -110,7 +109,9 @@ class ExYuTeka : MainAPI() {
                 sec.selectFirst(".section-title")?.text()?.contains(targetHeader, true) == true
             }
             if (section != null) {
-                section.select("a.card, div.card").forEach { parseCardElement(it)?.let { r -> results.add(r) } }
+                section.select("a.card, div.card").forEach { el ->
+                    parseCardElement(el)?.let { results.add(it) }
+                }
             } else {
                 results.addAll(parseCards(document))
             }
@@ -287,23 +288,6 @@ class ExYuTeka : MainAPI() {
         } catch (_: Exception) { plain }
     }
 
-    private fun forward(link: ExtractorLink, label: String, callback: (ExtractorLink) -> Unit) {
-        val renamed = runBlocking {
-            newExtractorLink(
-                source = this@ExYuTeka.name,
-                name = label,
-                url = link.url,
-                type = link.type
-            ) {
-                this.referer = link.referer
-                this.quality = link.quality
-                this.headers = link.headers
-                this.extractorData = link.extractorData
-            }
-        }
-        callback(renamed)
-    }
-
     private fun collectCandidates(doc: Document, rawHtml: String): Set<String> {
         val html = unpack(rawHtml)
         val out = linkedSetOf<String>()
@@ -316,7 +300,9 @@ class ExYuTeka : MainAPI() {
             if (v.startsWith("http") || v.startsWith("//") || v.startsWith("/")) out.add(fixUrl(v))
         }
 
-        doc.select("iframe, frame, embed, source, video").forEach { add(it.attr("src")); add(it.attr("data-src")) }
+        doc.select("iframe, frame, embed, source, video").forEach {
+            add(it.attr("src")); add(it.attr("data-src"))
+        }
         doc.select("[data-src], [data-url], [data-embed], [data-play-url], [data-server], [data-link], [data-file]")
             .forEach { el ->
                 listOf("data-src", "data-url", "data-embed", "data-play-url", "data-server", "data-link", "data-file")
@@ -389,7 +375,7 @@ class ExYuTeka : MainAPI() {
         return found
     }
 
-    // ------------------------------------------------ Byse (ehemals Filemoon) Extractor
+    // ------------------------------------------- Byse (ehemals Filemoon) Extractor
 
     private fun b64UrlDecode(s: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
@@ -397,10 +383,6 @@ class ExYuTeka : MainAPI() {
         return Base64.decode(fixed + "=".repeat(pad), Base64.DEFAULT)
     }
 
-    /**
-     * Byse = neues Filemoon. Funktioniert auch mit unbekannten Mirror-Domains (z.B. n1mwq.org),
-     * die Cloudstreams eingebauter ByseSX-Extractor nicht kennt.
-     */
     private suspend fun parseByse(
         embedUrl: String,
         emitted: MutableSet<String>,
@@ -412,7 +394,6 @@ class ExYuTeka : MainAPI() {
         if (code.length < 4) return false
 
         try {
-            // Schritt 1: details -> embed_frame_url
             val detailsText = app.get(
                 "$base/api/videos/$code/embed/details",
                 headers = mapOf(
@@ -428,7 +409,6 @@ class ExYuTeka : MainAPI() {
             val embedBase = urlBase(frameUrl)
             val embedCode = urlCode(frameUrl)
 
-            // Schritt 2: playback -> AES-GCM Payload
             val pbText = app.get(
                 "$embedBase/api/videos/$embedCode/embed/playback",
                 headers = mapOf(
@@ -452,12 +432,10 @@ class ExYuTeka : MainAPI() {
             val ivBytes = b64UrlDecode(ivStr)
             val cipherBytes = b64UrlDecode(payloadStr)
 
-            // Schritt 3: AES-256-GCM entschlüsseln
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, ivBytes))
             val plain = cipher.doFinal(cipherBytes).decodeToString().removePrefix("\uFEFF").replace("\\/", "/")
 
-            // Schritt 4: Quellen auslesen
             var found = false
             Regex("""\{[^{}]*\}""").findAll(plain).forEach { m ->
                 val obj = m.value
@@ -486,7 +464,7 @@ class ExYuTeka : MainAPI() {
         }
     }
 
-    /** Erst Cloudstreams Extractoren, dann Byse-Fallback für unbekannte Domains. */
+    /** Cloudstreams Extractoren; Links werden gesammelt und danach umbenannt (suspend-sicher). */
     private suspend fun tryHoster(
         url: String,
         referer: String,
@@ -498,26 +476,46 @@ class ExYuTeka : MainAPI() {
     ) {
         if (isJunk(url) || !visited.add(url)) return
 
-        // Bekannte Byse-Domain? Direkt eigener Extractor (liefert alle Qualitäten)
         if (url.contains("byse", true) || url.contains("filemoon", true)) {
             if (parseByse(url, emitted, callback)) return
         }
 
-        var got = false
-        val cb: (ExtractorLink) -> Unit = { got = true; forward(it, label, callback) }
+        val collected = mutableListOf<ExtractorLink>()
+        val collect: (ExtractorLink) -> Unit = { collected.add(it) }
+        var resolved = url
+
         try {
-            val finalUrl = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer)).url
-            if (finalUrl.isNotEmpty() && finalUrl != url && !isOwnSite(finalUrl) && visited.add(finalUrl)) {
-                loadExtractor(finalUrl, referer, subtitleCallback, cb)
-                if (!got) parseByse(finalUrl, emitted, callback)
+            resolved = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer)).url
+                .ifEmpty { url }
+            if (resolved != url && !isOwnSite(resolved) && visited.add(resolved)) {
+                loadExtractor(resolved, referer, subtitleCallback, collect)
             }
-            loadExtractor(url, referer, subtitleCallback, cb)
+            loadExtractor(url, referer, subtitleCallback, collect)
         } catch (_: Exception) {
-            try { loadExtractor(url, referer, subtitleCallback, cb) } catch (_: Exception) {}
+            try { loadExtractor(url, referer, subtitleCallback, collect) } catch (_: Exception) {}
         }
 
-        // Kein Extractor hat gepasst -> Byse-API试探 (neue Mirror-Domains wie n1mwq.org)
-        if (!got) parseByse(url, emitted, callback)
+        // Umbenennen erst HIER (wir sind wieder im suspend-Kontext)
+        collected.forEach { link ->
+            callback(newExtractorLink(
+                source = this.name,
+                name = "$label (${link.name})",
+                url = link.url,
+                type = link.type
+            ) {
+                this.referer = link.referer
+                this.quality = link.quality
+                this.headers = link.headers
+                this.extractorData = link.extractorData
+            })
+        }
+
+        // Kein Extractor hat gepasst -> Byse-API versuchen (unbekannte Mirrors wie n1mwq.org)
+        if (collected.isEmpty()) {
+            if (!parseByse(resolved, emitted, callback) && resolved != url) {
+                parseByse(url, emitted, callback)
+            }
+        }
     }
 
     // ------------------------------------------------------------------ loadLinks
@@ -533,6 +531,13 @@ class ExYuTeka : MainAPI() {
         val emitted = mutableSetOf<String>()
         val wrapped: (ExtractorLink) -> Unit = { foundAny = true; callback(it) }
 
+        fun priority(u: String) = when {
+            u.contains("byse", true) || u.contains("filemoon", true) -> 4
+            u.contains("/e/") || u.contains("/embed/") -> 3
+            Regex("""/[a-z0-9]{3,}/[a-z0-9]{6,}""", RegexOption.IGNORE_CASE).containsMatchIn(u) -> 2
+            else -> 1
+        }
+
         val page = app.get(data, headers = headers)
         val mainCandidates = collectCandidates(page.document, page.text)
 
@@ -545,12 +550,9 @@ class ExYuTeka : MainAPI() {
                 slugs.add(it.groupValues[1].removeSuffix(".mp4").trim())
             }
         }
-        var dsFound = false
         for (slug in slugs) {
-            if (dsFound) break
             val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
             for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
-                if (dsFound) break
                 for (dsUrl in listOf(
                     "https://dsplayer.site/watch.php?v=$s.mp4",
                     "https://dsplayer.site/watch.php?v=$s",
@@ -560,9 +562,7 @@ class ExYuTeka : MainAPI() {
                     if (!visited.add(dsUrl)) continue
                     try {
                         val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                        if (directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)) {
-                            dsFound = true; break
-                        }
+                        directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)
                     } catch (_: Exception) {}
                 }
             }
@@ -585,17 +585,12 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        fun priority(u: String) = when {
-            u.contains("byse", true) || u.contains("filemoon", true) -> 4
-            u.contains("/e/") || u.contains("/embed/") -> 3
-            Regex("""/[a-z0-9]{3,}/[a-z0-9]{6,}""", RegexOption.IGNORE_CASE).containsMatchIn(u) -> 2
-            else -> 1
-        }
-
         // 3. Externe Hoster auf der Hauptseite
         mainCandidates.filterNot { isOwnSite(it) || it.contains("dsplayer") }
             .sortedByDescending { priority(it) }.take(14)
-            .forEach { tryHoster(it, data, "$name - ${urlBase(it).substringAfter("//")}", visited, emitted, subtitleCallback, wrapped) }
+            .forEach {
+                tryHoster(it, data, "$name - ${urlBase(it).substringAfter("//")}", visited, emitted, subtitleCallback, wrapped)
+            }
 
         // 4. Interne Player-Seiten
         var budget = 28
@@ -617,9 +612,6 @@ class ExYuTeka : MainAPI() {
                 val subDoc = resp.document
                 val subCands = collectCandidates(subDoc, subHtml)
 
-                if (pUrl.contains("dsplayer") || subCands.any { it.contains("cdn.dsplayer") }) {
-                    if (directVideos(subDoc, subHtml, pUrl, "$name - DSServer", emitted, wrapped)) dsFound = true
-                }
                 directVideos(subDoc, subHtml, pUrl, label, emitted, wrapped)
 
                 subCands.filterNot { isOwnSite(it) }
@@ -638,17 +630,19 @@ class ExYuTeka : MainAPI() {
                     }
 
                 subCands.filter { isOwnSite(it) && it != pUrl && (it.contains(".php") || it.contains("/embed")) }
-                    .take(4).forEach inner@{ inner ->
-                        if (!visited.add(inner)) return@inner
+                    .take(4).forEach loop@{ innerUrl ->
+                        if (!visited.add(innerUrl)) return@loop
                         try {
-                            val r2 = app.get(inner, headers = mapOf("User-Agent" to userAgent, "Referer" to pUrl))
-                            if (!isOwnSite(r2.url) && r2.url != inner) {
+                            val r2 = app.get(innerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to pUrl))
+                            if (!isOwnSite(r2.url) && r2.url != innerUrl) {
                                 tryHoster(r2.url, pUrl, label, visited, emitted, subtitleCallback, wrapped)
                             } else {
                                 collectCandidates(r2.document, r2.text).filterNot { isOwnSite(it) }
                                     .sortedByDescending { priority(it) }.take(8)
-                                    .forEach { tryHoster(it, inner, label, visited, emitted, subtitleCallback, wrapped) }
-                                directVideos(r2.document, r2.text, inner, label, emitted, wrapped)
+                                    .forEach {
+                                        tryHoster(it, innerUrl, label, visited, emitted, subtitleCallback, wrapped)
+                                    }
+                                directVideos(r2.document, r2.text, innerUrl, label, emitted, wrapped)
                             }
                         } catch (_: Exception) {}
                     }
