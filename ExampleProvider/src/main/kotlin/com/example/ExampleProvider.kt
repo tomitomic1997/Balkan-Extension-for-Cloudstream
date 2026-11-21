@@ -6,6 +6,8 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.math.BigInteger
@@ -32,7 +34,6 @@ class ExYuTeka : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // Fester UA für alle Byse-API-Calls (Attest-Cache ist UA-gebunden)
     private val byseUA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
     private val embedOrigin = "exyuteka.net"
@@ -41,7 +42,6 @@ class ExYuTeka : MainAPI() {
         Log.d("ExYuTeka", msg)
     }
 
-    // ---------------- Attest-Cache (10 Minuten pro Host) ----------------
     private class AttestCache(
         val token: String, val viewerId: String, val deviceId: String,
         val confidence: Double, val ts: Long
@@ -396,7 +396,7 @@ class ExYuTeka : MainAPI() {
     }
 
     // ==================================================================
-    //  BYSE / FILEMOON ENGINE (Challenge-Flow, Port von docchi-players)
+    //  BYSE / FILEMOON ENGINE
     // ==================================================================
 
     private fun b64UrlDecode(s: String): ByteArray {
@@ -417,8 +417,6 @@ class ExYuTeka : MainAPI() {
             else -> raw
         }
     }
-
-    // ---------- Proof-of-Work Solver (1:1 aus pow_solver.c) ----------
 
     private fun rl(v: Int, s: Int): Int = (v shl s) or (v ushr (32 - s))
 
@@ -507,12 +505,24 @@ class ExYuTeka : MainAPI() {
         return null
     }
 
-    // ---------- HTTP-Helfer für die Byse-API ----------
+    // ---------- Mini-JSON-Builder (keine Serializer-Abhängigkeit) ----------
+
+    private fun toJson(v: Any?): String = when (v) {
+        null -> "null"
+        is String -> "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        is Boolean -> v.toString()
+        is Int -> v.toString()
+        is Long -> v.toString()
+        is Double -> v.toString()
+        is Map<*, *> -> v.entries.joinToString(",", "{", "}") { "\"${it.key}\":${toJson(it.value)}" }
+        is List<*> -> v.joinToString(",", "[", "]") { toJson(it) }
+        else -> "\"" + v.toString() + "\""
+    }
 
     private fun jStr(json: String, key: String): String? =
         Regex(""""$key"\s*:\s*"([^"]*)"""").find(json)?.groupValues?.get(1)
 
-    private suspend fun byseGet(url: String, host: String, extra: Map<String, String> = emptyMap()): String? =
+    private suspend fun byseGet(url: String, host: String): String? =
         try {
             app.get(
                 url,
@@ -521,19 +531,20 @@ class ExYuTeka : MainAPI() {
                     "Accept" to "*/*",
                     "Referer" to "https://$host/",
                     "Origin" to "https://$host"
-                ) + extra
+                )
             ).text
         } catch (e: Exception) {
             dbg("BYSE GET Fehler $url: ${e.message}")
             null
         }
 
-    private suspend fun bysePost(
-        url: String, payload: Map<String, Any?>,
-        headers: Map<String, String>
-    ): String? =
+    private suspend fun bysePost(url: String, payload: Map<String, Any?>, hdrs: Map<String, String>): String? =
         try {
-            app.post(url, headers = headers, json = payload).text
+            app.post(
+                url,
+                headers = hdrs + ("Content-Type" to "application/json"),
+                requestBody = toJson(payload).toRequestBody("application/json".toMediaTypeOrNull())
+            ).text
         } catch (e: Exception) {
             dbg("BYSE POST Fehler $url: ${e.message}")
             null
@@ -572,30 +583,17 @@ class ExYuTeka : MainAPI() {
         val dId = (0 until 32).map { "0123456789abcdef".random() }.joinToString("")
         val ctime = System.currentTimeMillis() / 1000
         val conf = Math.round((0.6 + Math.random() * 0.3) * 100) / 100.0
-        val tData = mutableMapOf<String, Any?>(
+        val tData = linkedMapOf<String, Any?>(
             "viewer_id" to vId, "device_id" to dId, "confidence" to conf,
             "iat" to ctime, "exp" to ctime + 600
         )
-        val json = tData.entries.joinToString(",", "{", "}") { """"${it.key}":${jsonVal(it.value)}""" }
-        val bdata = b64UrlEncode(json.toByteArray())
+        val bdata = b64UrlEncode(toJson(tData).toByteArray())
         val sig = b64UrlEncode(MessageDigest.getInstance("SHA-256").digest(bdata.toByteArray()))
-        val token = "$bdata.$sig"
         tData.remove("iat"); tData.remove("exp")
-        tData["token"] = token
+        tData["token"] = "$bdata.$sig"
         return mapOf("fingerprint" to tData)
     }
 
-    private fun jsonVal(v: Any?): String = when (v) {
-        null -> "null"
-        is String -> "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-        is Boolean -> v.toString()
-        is Double -> v.toString()
-        is Long -> v.toString()
-        is Int -> v.toString()
-        else -> "\"" + v.toString() + "\""
-    }
-
-    /** 5-Stufen-Challenge: challenge -> attest -> captcha(PoW) -> verify -> playback */
     private suspend fun challengePlayback(
         host: String, code: String, prefix: String, embedUrl: String
     ): String? {
@@ -611,10 +609,10 @@ class ExYuTeka : MainAPI() {
             "X-Embed-Parent" to embedUrl
         )
 
-        var token: String?
-        var viewerId: String?
-        var deviceId: String?
-        var confidence: Double
+        val token: String
+        val viewerId: String
+        val deviceId: String
+        val confidence: Double
 
         val cached = attestCache[host]?.takeIf { System.currentTimeMillis() - it.ts < 600_000 }
         if (cached != null) {
@@ -622,15 +620,12 @@ class ExYuTeka : MainAPI() {
             deviceId = cached.deviceId; confidence = cached.confidence
             dbg("BYSE attest cache für $host")
         } else {
-            val challenge = bysePost(
-                "https://$host/api/videos/access/challenge",
-                emptyMap(), apiHeaders
-            ) ?: return null
+            val challenge = bysePost("https://$host/api/videos/access/challenge", emptyMap(), apiHeaders)
+                ?: return null
             val challengeId = jStr(challenge, "challenge_id") ?: return null
             val nonce = jStr(challenge, "nonce") ?: return null
             dbg("BYSE challenge ok")
 
-            // ECDSA P-256 Keypair + Signatur
             val kpg = KeyPairGenerator.getInstance("EC")
             kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
             val kp = kpg.generateKeyPair()
@@ -658,11 +653,12 @@ class ExYuTeka : MainAPI() {
                 ),
                 apiHeaders
             ) ?: return null
-            token = jStr(attest, "token") ?: return null
-            viewerId = jStr(attest, "viewer_id") ?: ""
-            deviceId = jStr(attest, "device_id") ?: ""
-            confidence = Regex(""""confidence"\s*:\s*([0-9.]+)""").find(attest)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.8
-            attestCache[host] = AttestCache(token, viewerId, deviceId, confidence, System.currentTimeMillis())
+            val t = jStr(attest, "token") ?: return null
+            val v = jStr(attest, "viewer_id") ?: ""
+            val d = jStr(attest, "device_id") ?: ""
+            val c = Regex(""""confidence"\s*:\s*([0-9.]+)""").find(attest)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.8
+            attestCache[host] = AttestCache(t, v, d, c, System.currentTimeMillis())
+            token = t; viewerId = v; deviceId = d; confidence = c
             dbg("BYSE attest ok")
         }
 
@@ -675,11 +671,11 @@ class ExYuTeka : MainAPI() {
         )
         val flowHeaders = apiHeaders + embedExtra + ("Cookie" to cookie)
 
-        val captcha = bysePost(
-            "https://$host/api/videos/$code/${prefix}captcha", fpPayload, flowHeaders
-        ) ?: return null
+        val captcha = bysePost("https://$host/api/videos/$code/${prefix}captcha", fpPayload, flowHeaders)
+            ?: return null
         val powNonce = jStr(captcha, "pow_nonce") ?: return null
-        val powDifficulty = Regex(""""pow_difficulty"\s*:\s*(\d+)""").find(captcha)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val powDifficulty = Regex(""""pow_difficulty"\s*:\s*(\d+)""").find(captcha)?.groupValues?.get(1)?.toIntOrNull()
+            ?: return null
         val powToken = jStr(captcha, "pow_token") ?: return null
         dbg("BYSE captcha: difficulty=$powDifficulty")
 
@@ -696,15 +692,12 @@ class ExYuTeka : MainAPI() {
             ),
             flowHeaders
         ) ?: return null
-        if (jStr(verify, "status") != "ok") {
-            val captchaTokenAlt = jStr(verify, "token")
-            if (captchaTokenAlt == null) {
-                dbg("BYSE verify fehlgeschlagen: ${verify.take(120)}")
-                attestCache.remove(host)
-                return null
-            }
+        val captchaToken = jStr(verify, "token")
+        if (captchaToken == null) {
+            dbg("BYSE verify fehlgeschlagen: ${verify.take(120)}")
+            attestCache.remove(host)
+            return null
         }
-        val captchaToken = jStr(verify, "token") ?: return null
         dbg("BYSE verify ok")
 
         return bysePost(
@@ -714,7 +707,6 @@ class ExYuTeka : MainAPI() {
         )
     }
 
-    /** Legacy-Pfad: POST playback mit selbstsigniertem Fingerprint */
     private suspend fun legacyPlayback(host: String, code: String, prefix: String): String? =
         bysePost(
             "https://$host/api/videos/$code/${prefix}playback",
@@ -741,7 +733,7 @@ class ExYuTeka : MainAPI() {
         try {
             var prefix = "embed/"
             var details = byseGet("https://$host/api/videos/$code/${prefix}details", host)
-            if (details == null || !details.contains("embed_frame_url") && details.contains("error")) {
+            if (details == null || details.contains("\"error\"")) {
                 details = byseGet("https://$host/api/videos/$code/details", host)
                 prefix = ""
             }
@@ -770,10 +762,9 @@ class ExYuTeka : MainAPI() {
                 return false
             }
 
-            // Quellen: entweder plain "sources" oder verschlüsseltes "playback"
             var sourcesJson = playback
             if (playback.contains("\"playback\"")) {
-                val pb = Regex(""""playback"\s*:\s*\{.*\}\s*\}?\s*$""", RegexOption.DOT_MATCHES_ALL)
+                val pb = Regex(""""playback"\s*:\s*\{.*""", RegexOption.DOT_MATCHES_ALL)
                     .find(playback)?.value ?: playback
                 val ivStr = jStr(pb, "iv") ?: return false
                 val payloadStr = jStr(pb, "payload") ?: return false
@@ -893,19 +884,30 @@ class ExYuTeka : MainAPI() {
         visited: MutableSet<String>, emitted: MutableSet<String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        if (isJunk(url) || !visited.add(url)) return
+        if (isJunk(url)) return
         dbg("SERVER: $url")
 
+        // DSServer: Haupt-URL DIREKT abrufen (kein visited-Gate!), dann Varianten
         if (url.contains("dsplayer.site")) {
-            for (variant in listOf(url, url.replace("/embed2/video.php?slug=", "/watch.php?v=") + ".mp4")) {
+            runCatching {
+                val r = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+                directVideos(r.document, r.text, url, "$name - DSServer", emitted, callback)
+            }
+            for (variant in listOf(
+                url.replace("/embed2/video.php?slug=", "/watch.php?v=") + ".mp4",
+                url.replace("/embed2/video.php?slug=", "/watch.php?v="),
+                url.replace("/embed2/video.php?slug=", "/video.php?slug=")
+            )) {
                 if (!visited.add(variant)) continue
-                try {
+                runCatching {
                     val r = app.get(variant, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
                     directVideos(r.document, r.text, variant, "$name - DSServer", emitted, callback)
-                } catch (_: Exception) {}
+                }
             }
             return
         }
+
+        if (!visited.add(url)) return
 
         if (url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
             if (parseByse(url, emitted, callback)) return
@@ -933,35 +935,47 @@ class ExYuTeka : MainAPI() {
         val emitted = mutableSetOf<String>()
         val wrapped: (ExtractorLink) -> Unit = { foundAny = true; callback(it) }
 
-        dbg("=== LOADLINKS: $data ===")
-        val page = app.get(data, headers = headers)
-        val serverUrls = linkedSetOf<String>()
-        serverUrls.addAll(extractServerUrls(page.text))
+        try {
+            dbg("=== LOADLINKS: $data ===")
+            val page = app.get(data, headers = headers)
+            val serverUrls = linkedSetOf<String>()
+            serverUrls.addAll(extractServerUrls(page.text))
 
-        val mainCands = collectCandidates(page.document, page.text)
-        mainCands.filter { isOwnSite(it) && it != data && (it.contains(".php") || it.contains("/embed")) }
-            .take(6)
-            .forEach { p ->
-                if (!visited.add(p)) return@forEach
-                try {
-                    val r = app.get(p, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
-                    val found = extractServerUrls(r.text)
-                    dbg("FRAME $p -> ${found.size} Server")
-                    serverUrls.addAll(found)
-                    if (found.isEmpty()) {
-                        serverUrls.addAll(collectCandidates(r.document, r.text).filterNot { isOwnSite(it) })
+            val mainCands = collectCandidates(page.document, page.text)
+            mainCands.filter { isOwnSite(it) && it != data && (it.contains(".php") || it.contains("/embed")) }
+                .take(6)
+                .forEach { p ->
+                    if (!visited.add(p)) return@forEach
+                    runCatching {
+                        val r = app.get(p, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
+                        val found = extractServerUrls(r.text)
+                        dbg("FRAME $p -> ${found.size} Server")
+                        serverUrls.addAll(found)
+                        if (found.isEmpty()) {
+                            serverUrls.addAll(collectCandidates(r.document, r.text).filterNot { isOwnSite(it) })
+                        }
                     }
-                } catch (_: Exception) {}
+                }
+
+            // Backup: externe URLs direkt von der Hauptseite
+            if (serverUrls.isEmpty()) {
+                serverUrls.addAll(mainCands.filterNot { isOwnSite(it) }.take(10))
             }
 
-        dbg("SERVERLISTE (${serverUrls.size}):")
-        serverUrls.forEach { dbg("  -> $it") }
+            dbg("SERVERLISTE (${serverUrls.size}):")
+            serverUrls.forEach { dbg("  -> $it") }
 
-        serverUrls.forEach { u ->
-            handleServer(u, data, "$name - ${urlBase(u).substringAfter("//").substringBefore(".")}", visited, emitted, subtitleCallback, wrapped)
-        }
+            serverUrls.forEach { u ->
+                runCatching {
+                    handleServer(
+                        u, data,
+                        "$name - ${urlBase(u).substringAfter("//").substringBefore(".")}",
+                        visited, emitted, subtitleCallback, wrapped
+                    )
+                }
+            }
 
-        if (!foundAny && emitted.isEmpty()) {
+            // DSServer-Slug-Fallback (immer, als Sicherheitsnetz)
             val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
             val slugs = mutableSetOf<String>()
             if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
@@ -979,13 +993,15 @@ class ExYuTeka : MainAPI() {
                         "https://dsplayer.site/embed2/video.php?slug=$s"
                     )) {
                         if (!visited.add(dsUrl)) continue
-                        try {
+                        runCatching {
                             val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
                             directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)
-                        } catch (_: Exception) {}
+                        }
                     }
                 }
             }
+        } catch (e: Exception) {
+            dbg("LOADLINKS CRASH: ${e.message}")
         }
 
         dbg("=== ENDE: foundAny=$foundAny emitted=${emitted.size} ===")
