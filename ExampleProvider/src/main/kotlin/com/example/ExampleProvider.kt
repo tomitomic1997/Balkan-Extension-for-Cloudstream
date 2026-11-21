@@ -176,6 +176,15 @@ class ExYuTeka : MainAPI() {
     private fun urlCode(u: String): String = u.substringAfter("://").substringAfter("/", "").substringBefore("?").substringBefore("#").trimEnd('/').substringAfterLast("/")
     private fun unpack(html: String): String { val plain = html.replace("\\/", "/"); return try { if (plain.contains("eval(function(p,a,c,k,e,")) getAndUnpack(plain).replace("\\/", "/") else plain } catch (_: Exception) { plain } }
 
+    // NEU: löst relative URLs gegen die Player-Seite auf (wichtig für Abyss-MKV)
+    private fun resolveUrl(base: String, raw: String): String {
+        val r = raw.trim().replace("\\/", "/")
+        if (r.startsWith("http")) return r
+        if (r.startsWith("//")) return "https:$r"
+        val host = urlBase(base)
+        return if (r.startsWith("/")) host + r else "$host/${r.removePrefix("/")}"
+    }
+
     private fun extractServerUrls(html: String): List<String> {
         val out = linkedSetOf<String>()
         Regex("""case\s+\d+\s*:\s*src\s*=\s*["']([^"']+)["']""").findAll(html).forEach { out.add(it.groupValues[1].trim()) }
@@ -197,23 +206,41 @@ class ExYuTeka : MainAPI() {
         return out.filterNot { isJunk(it) }.toSet()
     }
 
+    // FIX: unterstützt jetzt auch .mkv / .webm und löst relative Dateinamen auf
     private suspend fun directVideos(doc: Document, rawHtml: String, pageUrl: String, label: String, emitted: MutableSet<String>, callback: (ExtractorLink) -> Unit): Boolean {
         val html = unpack(rawHtml)
         var found = false
         val cands = linkedSetOf<String>()
+
         doc.select("video source, video").forEach { val s = it.attr("src").ifEmpty { it.attr("data-src") }; if (s.isNotEmpty()) cands.add(s) }
-        listOf(Regex("""["'](https?://[^"'\s]+\.m3u8[^"'\s]*)["']"""), Regex("""["'](https?://[^"'\s]+\.mp4[^"'\s]*)["']"""), Regex("""["'](/[^"'\s]+\.(?:mp4|m3u8)[^"'\s]*)["']"""), Regex("""(?:file|src|source|video_url|videoUrl|hls)\s*[:=]\s*["']([^"']+)["']""")).forEach { r -> r.findAll(html).forEach { cands.add(it.groupValues[1]) } }
+
+        // <title> enthält bei Abyss oft den Dateinamen: "glo-....mkv"
+        doc.select("title").forEach {
+            val t = it.text().trim()
+            if (t.endsWith(".mkv", true) || t.endsWith(".mp4", true) || t.endsWith(".webm", true)) cands.add(t)
+        }
+
+        listOf(
+            Regex("""["'](https?://[^"'\s]+\.m3u8[^"'\s]*)["']"""),
+            Regex("""["'](https?://[^"'\s]+\.(?:mp4|mkv|webm)[^"'\s]*)["']"""),
+            Regex("""["'](/[^"'\s]+\.(?:mp4|mkv|webm|m3u8)[^"'\s]*)["']"""),
+            Regex("""["']([a-zA-Z0-9_\-\.]+\.(?:mp4|mkv|webm|m3u8))["']"""),
+            Regex("""(?:file|src|source|video_url|videoUrl|hls)\s*[:=]\s*["']([^"']+)["']""")
+        ).forEach { r -> r.findAll(html).forEach { cands.add(it.groupValues[1]) } }
+
         for (raw in cands) {
-            val u = fixUrl(raw.replace("\\/", "/").trim())
+            val u = resolveUrl(pageUrl, raw)
             if (u.isEmpty() || u.startsWith("blob:") || isJunk(u)) continue
             if (u.contains(".php") || u.contains("/watch") || u.contains("/embed/")) continue
             val clean = u.substringBefore("?")
             val isM3u8 = clean.endsWith(".m3u8") || u.contains(".m3u8")
-            val isMp4 = clean.endsWith(".mp4") || u.contains("/video/") || u.contains("cdn.dsplayer")
-            if (!isM3u8 && !isMp4) continue
+            val isDirect = clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") || u.contains("/video/") || u.contains("cdn.dsplayer")
+            if (!isM3u8 && !isDirect) continue
             if (!emitted.add(u)) continue
+
             val ref = if (u.contains("dsplayer")) "https://dsplayer.site/" else pageUrl
             val q = when { u.contains("1080") -> Qualities.P1080.value; u.contains("720") -> Qualities.P720.value; u.contains("480") -> Qualities.P480.value; else -> Qualities.P1080.value }
+            dbg("DIRECT VIDEO: $u")
             callback(newExtractorLink(source = this.name, name = label, url = u, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) { this.referer = ref; this.quality = q })
             found = true
         }
@@ -253,53 +280,78 @@ class ExYuTeka : MainAPI() {
         val apiHeaders = mapOf("User-Agent" to byseUA, "Accept" to "*/*", "Referer" to "https://$embedOrigin/", "Origin" to "https://$host")
         val embedExtra = mapOf("X-Embed-Origin" to embedOrigin, "X-Embed-Referer" to "https://$embedOrigin/", "X-Embed-Parent" to embedUrl)
         val cached = attestCache[host]?.takeIf { System.currentTimeMillis() - it.ts < 600_000 }
-        val (token, viewerId, deviceId, confidence) = if (cached != null) { dbg("BYSE cache OK"); Pair(Pair(cached.token, cached.viewerId), Pair(cached.deviceId, cached.confidence)) } else {
-            val challenge = bysePost("https://$host/api/videos/access/challenge", emptyMap(), apiHeaders) ?: return null; val challengeId = jStr(challenge, "challenge_id") ?: return null; val nonce = jStr(challenge, "nonce") ?: return null; dbg("BYSE challenge OK")
-            val kpg = KeyPairGenerator.getInstance("EC"); kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1")); val kp = kpg.generateKeyPair(); val signer = Signature.getInstance("SHA256withECDSA"); signer.initSign(kp.private); signer.update(nonce.toByteArray()); val signature = b64UrlEncode(signer.sign()); val pub = kp.public as ECPublicKey
+        val token: String; val viewerId: String; val deviceId: String; val confidence: Double
+        if (cached != null) { dbg("BYSE cache OK"); token = cached.token; viewerId = cached.viewerId; deviceId = cached.deviceId; confidence = cached.confidence }
+        else {
+            val challenge = bysePost("https://$host/api/videos/access/challenge", emptyMap(), apiHeaders) ?: return null
+            val challengeId = jStr(challenge, "challenge_id") ?: return null
+            val nonce = jStr(challenge, "nonce") ?: return null
+            dbg("BYSE challenge OK")
+            val kpg = KeyPairGenerator.getInstance("EC"); kpg.initialize(java.security.spec.ECGenParameterSpec("secp256r1")); val kp = kpg.generateKeyPair()
+            val signer = Signature.getInstance("SHA256withECDSA"); signer.initSign(kp.private); signer.update(nonce.toByteArray()); val signature = b64UrlEncode(signer.sign())
+            val pub = kp.public as ECPublicKey
             val jwk = mapOf("alg" to "ES256", "crv" to "P-256", "ext" to true, "key_ops" to listOf("verify"), "kty" to "EC", "x" to b64UrlEncode(big32(pub.w.affineX)), "y" to b64UrlEncode(big32(pub.w.affineY)))
             val attest = bysePost("https://$host/api/videos/access/attest", mapOf("viewer_id" to "", "device_id" to "", "challenge_id" to challengeId, "nonce" to nonce, "signature" to signature, "public_key" to jwk, "client" to clientFingerprint(), "storage" to emptyMap<String, String>(), "attributes" to mapOf("entropy" to "low")), apiHeaders) ?: return null
-            val t = jStr(attest, "token") ?: return null; val v = jStr(attest, "viewer_id") ?: ""; val d = jStr(attest, "device_id") ?: ""; val c = Regex(""""confidence"\s*:\s*([0-9.]+)""").find(attest)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.8
-            attestCache[host] = AttestCache(t, v, d, c, System.currentTimeMillis()); dbg("BYSE attest OK"); Pair(Pair(t, v), Pair(d, c))
+            val t = jStr(attest, "token") ?: return null; val v = jStr(attest, "viewer_id") ?: ""; val d = jStr(attest, "device_id") ?: ""
+            val c = Regex(""""confidence"\s*:\s*([0-9.]+)""").find(attest)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.8
+            attestCache[host] = AttestCache(t, v, d, c, System.currentTimeMillis()); dbg("BYSE attest OK")
+            token = t; viewerId = v; deviceId = d; confidence = c
         }
-        val (t, v) = token; val (d, c) = confidence
-        val cookie = "byse_viewer_id=$v; byse_device_id=$d"
-        val fpPayload = mapOf("fingerprint" to mapOf("token" to t, "viewer_id" to v, "device_id" to d, "confidence" to c))
+        val cookie = "byse_viewer_id=$viewerId; byse_device_id=$deviceId"
+        val fpPayload = mapOf("fingerprint" to mapOf("token" to token, "viewer_id" to viewerId, "device_id" to deviceId, "confidence" to confidence))
         val flowHeaders = apiHeaders + embedExtra + ("Cookie" to cookie)
         val captcha = bysePost("https://$host/api/videos/$code/${prefix}captcha", fpPayload, flowHeaders) ?: return null
-        val powNonce = jStr(captcha, "pow_nonce") ?: return null; val powDifficulty = Regex(""""pow_difficulty"\s*:\s*(\d+)""").find(captcha)?.groupValues?.get(1)?.toIntOrNull() ?: return null; val powToken = jStr(captcha, "pow_token") ?: return null
+        val powNonce = jStr(captcha, "pow_nonce") ?: return null
+        val powDifficulty = Regex(""""pow_difficulty"\s*:\s*(\d+)""").find(captcha)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val powToken = jStr(captcha, "pow_token") ?: return null
         dbg("BYSE captcha diff=$powDifficulty")
-        val solution = powSolve(powNonce, powDifficulty) ?: run { dbg("BYSE PoW FEHLER"); return null }; dbg("BYSE PoW gelöst")
+        val solution = powSolve(powNonce, powDifficulty) ?: run { dbg("BYSE PoW FEHLER"); return null }
+        dbg("BYSE PoW gelöst")
         val verify = bysePost("https://$host/api/videos/$code/${prefix}captcha/verify", mapOf("pow_token" to powToken, "solution" to solution, "fingerprint" to fpPayload["fingerprint"]), flowHeaders) ?: return null
-        val captchaToken = jStr(verify, "token"); if (captchaToken == null) { dbg("BYSE verify FAIL: ${verify.take(60)}"); attestCache.remove(host); return null }; dbg("BYSE verify OK")
+        val captchaToken = jStr(verify, "token")
+        if (captchaToken == null) { dbg("BYSE verify FAIL: ${verify.take(60)}"); attestCache.remove(host); return null }
+        dbg("BYSE verify OK")
         return bysePost("https://$host/api/videos/$code/${prefix}playback", fpPayload, flowHeaders + ("X-Captcha-Token" to captchaToken))
     }
     private suspend fun legacyPlayback(host: String, code: String, prefix: String): String? = bysePost("https://$host/api/videos/$code/${prefix}playback", legacyFingerprint(), mapOf("User-Agent" to byseUA, "Accept" to "*/*", "Referer" to "https://$host/", "Origin" to "https://$host"))
     private suspend fun parseByse(embedUrl: String, emitted: MutableSet<String>, callback: (ExtractorLink) -> Unit): Boolean = runCatching {
-        if (!embedUrl.startsWith("http")) return@runCatching false; val code = urlCode(embedUrl); if (code.length < 4) return@runCatching false; var host = urlBase(embedUrl).substringAfter("//")
+        if (!embedUrl.startsWith("http")) return@runCatching false
+        val code = urlCode(embedUrl); if (code.length < 4) return@runCatching false
+        var host = urlBase(embedUrl).substringAfter("//")
         dbg("BYSE start: $host / $code")
-        var prefix = "embed/"; var details = byseGet("https://$host/api/videos/$code/${prefix}details", host)
+        var prefix = "embed/"
+        var details = byseGet("https://$host/api/videos/$code/${prefix}details", host)
         if (details == null || details.contains("\"error\"")) { details = byseGet("https://$host/api/videos/$code/details", host); prefix = "" }
         if (details == null) return@runCatching false
-        val frameUrl = jStr(details, "embed_frame_url"); if (!frameUrl.isNullOrEmpty()) { val fHost = urlBase(frameUrl).substringAfter("//"); if (fHost.isNotEmpty()) host = fHost }
-        val settings = byseGet("https://$host/api/videos/$code/${prefix}settings", host); val captchaRequired = settings != null && Regex(""""captcha_required"\s*:\s*true""").containsMatchIn(settings)
+        val frameUrl = jStr(details, "embed_frame_url")
+        if (!frameUrl.isNullOrEmpty()) { val fHost = urlBase(frameUrl).substringAfter("//"); if (fHost.isNotEmpty()) host = fHost }
+        val settings = byseGet("https://$host/api/videos/$code/${prefix}settings", host)
+        val captchaRequired = settings != null && Regex(""""captcha_required"\s*:\s*true""").containsMatchIn(settings)
         val playback = if (captchaRequired) challengePlayback(host, code, prefix, embedUrl) else (legacyPlayback(host, code, prefix) ?: challengePlayback(host, code, prefix, embedUrl))
         if (playback == null) return@runCatching false
         var sourcesJson = playback
         if (playback.contains("\"playback\"")) {
             val pb = Regex(""""playback"\s*:\s*\{.*""", RegexOption.DOT_MATCHES_ALL).find(playback)?.value ?: playback
-            val ivStr = jStr(pb, "iv") ?: return@runCatching false; val payloadStr = jStr(pb, "payload") ?: return@runCatching false
+            val ivStr = jStr(pb, "iv") ?: return@runCatching false
+            val payloadStr = jStr(pb, "payload") ?: return@runCatching false
             val partsBlock = Regex(""""key_parts"\s*:\s*\[([^\]]*)\]""").find(pb)?.groupValues?.get(1) ?: return@runCatching false
             var parts = Regex(""""([^"]+)"""").findAll(partsBlock).map { it.groupValues[1] }.toList()
             val version = Regex(""""version"\s*:\s*(\d+)""").find(pb)?.groupValues?.get(1)?.toIntOrNull()
             if (version != null && parts.size >= 2) { val v = version; parts = listOf(parts[v - 1], parts[parts.size - v]) }
             if (parts.size < 2) return@runCatching false
-            val keyBytes = b64UrlDecode(parts[0]) + b64UrlDecode(parts[1]); val cipher = Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, b64UrlDecode(ivStr)))
+            val keyBytes = b64UrlDecode(parts[0]) + b64UrlDecode(parts[1])
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, b64UrlDecode(ivStr)))
             sourcesJson = cipher.doFinal(b64UrlDecode(payloadStr)).decodeToString().removePrefix("\uFEFF").replace("\\/", "/")
         }
         var found = false
         Regex("""\{[^{}]*\}""").findAll(sourcesJson).forEach { m ->
-            val obj = m.value; val u = jStr(obj, "url") ?: return@forEach; if (!u.startsWith("http")) return@forEach; if (!emitted.add(u)) return@forEach
-            val h = Regex(""""height"\s*:\s*(\d+)""").find(obj)?.groupValues?.get(1)?.toIntOrNull(); val lbl = jStr(obj, "label"); val isM3u8 = u.contains(".m3u8") || obj.contains("mpegurl", true) || obj.contains("hls", true)
+            val obj = m.value; val u = jStr(obj, "url") ?: return@forEach
+            if (!u.startsWith("http")) return@forEach
+            if (!emitted.add(u)) return@forEach
+            val h = Regex(""""height"\s*:\s*(\d+)""").find(obj)?.groupValues?.get(1)?.toIntOrNull()
+            val lbl = jStr(obj, "label")
+            val isM3u8 = u.contains(".m3u8") || obj.contains("mpegurl", true) || obj.contains("hls", true)
             dbg("BYSE LINK: ${u.take(60)}")
             callback(newExtractorLink(source = this.name, name = "$name - Byse" + (lbl?.let { " $it" } ?: h?.let { " ${it}p" } ?: ""), url = u, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) { this.referer = "https://$host/"; this.quality = h ?: Qualities.P1080.value; this.headers = mapOf("Referer" to "https://$host/", "User-Agent" to byseUA) })
             found = true
@@ -313,10 +365,11 @@ class ExYuTeka : MainAPI() {
         var ok = false
         try {
             val resp = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
-            dbg("GENERIC ${urlBase(url).substringAfter("//")} (${resp.text.length} Zeichen)")
-            val extern = collectCandidates(resp.document, resp.text).filterNot { isOwnSite(it) || it == url || it == resp.url }
+            val finalPage = resp.url.ifEmpty { url }
+            dbg("GENERIC ${urlBase(finalPage).substringAfter("//")} (${resp.text.length} Zeichen)")
+            val extern = collectCandidates(resp.document, resp.text).filterNot { isOwnSite(it) || it == url || it == finalPage }
             dbg("GENERIC extern: ${extern.take(4).joinToString(" | ")}")
-            if (directVideos(resp.document, resp.text, url, label, emitted, callback)) ok = true
+            if (directVideos(resp.document, resp.text, finalPage, label, emitted, callback)) ok = true
             val iframes = resp.document.select("iframe").map { it.attr("src").ifEmpty { it.attr("data-src") } }.filter { it.isNotEmpty() }.map { fixUrl(it) }.filterNot { isJunk(it) || it == url || visited.contains(it) }
             for (f in iframes.take(4)) {
                 visited.add(f)
@@ -324,9 +377,9 @@ class ExYuTeka : MainAPI() {
                 val col = mutableListOf<ExtractorLink>()
                 try { loadExtractor(f, url, subtitleCallback) { col.add(it) } } catch (_: Exception) {}
                 col.forEach { link -> callback(renameLink(link, label)); ok = true }
-                if (col.isEmpty()) { try { val r2 = app.get(f, headers = mapOf("User-Agent" to userAgent, "Referer" to url)); if (directVideos(r2.document, r2.text, f, label, emitted, callback)) ok = true } catch (_: Exception) {} }
+                if (col.isEmpty()) { try { val r2 = app.get(f, headers = mapOf("User-Agent" to userAgent, "Referer" to url)); if (directVideos(r2.document, r2.text, r2.url.ifEmpty { f }, label, emitted, callback)) ok = true } catch (_: Exception) {} }
             }
-            if (!ok && resp.url != url && (resp.url.contains("byse", true) || resp.url.contains("filemoon", true))) { if (parseByse(resp.url, emitted, callback)) ok = true }
+            if (!ok && finalPage != url && (finalPage.contains("byse", true) || finalPage.contains("filemoon", true))) { if (parseByse(finalPage, emitted, callback)) ok = true }
         } catch (e: Exception) { dbg("GENERIC Fehler: ${e.message?.take(50)}") }
         return ok
     }
@@ -341,17 +394,21 @@ class ExYuTeka : MainAPI() {
             visited.add(url); return
         }
         if (!visited.add(url)) return
+        if (url.contains("abyss", true) || url.contains("abyssplayer", true)) {
+            dbg("ABYS wird geladen: $url")
+            val collected = mutableListOf<ExtractorLink>()
+            try { loadExtractor(url, referer, subtitleCallback) { collected.add(it) } } catch (_: Exception) {}
+            if (collected.isNotEmpty()) { dbg("ABYS OK: ${collected.size}"); collected.forEach { link -> callback(renameLink(link, label)) }; return }
+            genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
+            return
+        }
         if (url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) { if (parseByse(url, emitted, callback)) return }
         val collected = mutableListOf<ExtractorLink>()
         try {
             val extReferer = if (url.contains("minochinos", true) || url.contains("vidhide", true)) referer else "$mainUrl/"
             loadExtractor(url, extReferer, subtitleCallback) { collected.add(it) }
         } catch (_: Exception) {}
-        if (collected.isNotEmpty()) {
-            dbg("EXTRACTOR OK: ${collected.size}")
-            collected.forEach { link -> callback(renameLink(link, label)) }
-            return
-        }
+        if (collected.isNotEmpty()) { dbg("EXTRACTOR OK: ${collected.size}"); collected.forEach { link -> callback(renameLink(link, label)) }; return }
         genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
     }
 
