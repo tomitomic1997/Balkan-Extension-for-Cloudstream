@@ -264,7 +264,6 @@ class ExYuTeka : MainAPI() {
         if (isJunk(url)) return
         dbg("SERVER: ${urlBase(url).substringAfter("//").substringBefore("/")}")
 
-        // DSServer: nur EIN Link (erste funktionierende Variante)
         if (url.contains("dsplayer.site")) {
             if (visited.contains(url)) return
             visited.add(url)
@@ -280,19 +279,16 @@ class ExYuTeka : MainAPI() {
 
         if (!visited.add(url)) return
 
-        // ABYS: Komplett entfernt (liefert nur 404)
         if (url.contains("abyss", true) || url.contains("abyssplayer", true)) {
             dbg("ABYS übersprungen (404)")
             return
         }
 
-        // Byse/Filemoon: nur generic, kein loadExtractor (crasht)
         if (url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
             genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
             return
         }
 
-        // Andere Hoster (Streamtape, Minochinos, VidHide, etc.)
         val collected = mutableListOf<ExtractorLink>()
         try {
             val extReferer = if (url.contains("minochinos", true) || url.contains("vidhide", true)) referer else "$mainUrl/"
@@ -314,25 +310,27 @@ class ExYuTeka : MainAPI() {
             }
             if (serverUrls.isEmpty()) serverUrls.addAll(mainCands.filterNot { isOwnSite(it) }.take(10))
             dbg("${serverUrls.size} Server gefunden")
-            serverUrls.forEach { u -> runCatching { handleServer(u, data, "$name - ${urlBase(u).substringAfter("//").substringBefore(".")}", visited, emitted, subtitleCallback, wrapped) } }
-            if (emitted.none { it.contains("dsplayer") }) {
-                val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
-                val slugs = mutableSetOf<String>(); if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
-                serverUrls.forEach { u -> Regex("""[?&](?:search|v|slug|film)=([^&"'\s<>\\]+)""").findAll(u).forEach { slugs.add(it.groupValues[1].removeSuffix(".mp4").trim()) } }
-                var slugFound = false
-                for (slug in slugs) {
+
+            // FIX: DSServer-Slug-Fallback ZUERST ausführen, damit DSServer an erster Stelle steht
+            val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
+            val slugs = mutableSetOf<String>(); if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
+            serverUrls.forEach { u -> Regex("""[?&](?:search|v|slug|film)=([^&"'\s<>\\]+)""").findAll(u).forEach { slugs.add(it.groupValues[1].removeSuffix(".mp4").trim()) } }
+            var slugFound = false
+            for (slug in slugs) {
+                if (slugFound) break
+                val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
+                for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
                     if (slugFound) break
-                    val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
-                    for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
+                    for (dsUrl in listOf("https://dsplayer.site/watch.php?v=$s.mp4", "https://dsplayer.site/embed2/video.php?slug=$s")) {
                         if (slugFound) break
-                        for (dsUrl in listOf("https://dsplayer.site/watch.php?v=$s.mp4", "https://dsplayer.site/embed2/video.php?slug=$s")) {
-                            if (slugFound) break
-                            if (!visited.add(dsUrl)) continue
-                            runCatching { val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")); if (directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)) slugFound = true }
-                        }
+                        if (!visited.add(dsUrl)) continue
+                        runCatching { val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")); if (directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)) slugFound = true }
                     }
                 }
             }
+
+            // Dann die anderen Server verarbeiten
+            serverUrls.forEach { u -> runCatching { handleServer(u, data, "$name - ${urlBase(u).substringAfter("//").substringBefore(".")}", visited, emitted, subtitleCallback, wrapped) } }
         } catch (e: Exception) { dbg("CRASH: ${e.message?.take(60)}") }
         dbg("Fertig: ${emitted.size} Links"); return foundAny || emitted.isNotEmpty()
     }
