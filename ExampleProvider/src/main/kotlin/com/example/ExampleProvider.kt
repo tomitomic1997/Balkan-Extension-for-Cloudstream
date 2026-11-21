@@ -157,8 +157,20 @@ class ExYuTeka : MainAPI() {
     }
     private fun isOwnSite(url: String) = url.contains("exyuteka", true)
     private fun urlBase(u: String): String { val scheme = u.substringBefore("://", "https"); val host = u.substringAfter("://").substringBefore("/"); return "$scheme://$host" }
-    private fun urlCode(u: String): String = u.substringAfter("://").substringAfter("/", "").substringBefore("?").substringBefore("#").trimEnd('/').substringAfterLast("/")
     private fun unpack(html: String): String { val plain = html.replace("\\/", "/"); return try { if (plain.contains("eval(function(p,a,c,k,e,")) getAndUnpack(plain).replace("\\/", "/") else plain } catch (_: Exception) { plain } }
+
+    private fun resolveUrl(base: String, raw: String): String {
+        val r = raw.trim().replace("\\/", "/")
+        if (r.startsWith("http")) return r
+        if (r.startsWith("//")) return "https:$r"
+        val host = urlBase(base)
+        return if (r.startsWith("/")) host + r else "$host/${r.removePrefix("/")}"
+    }
+
+    private fun fileExt(u: String): String {
+        val clean = u.substringBefore("?").substringBefore("#")
+        return clean.substringAfterLast(".", "bin").lowercase()
+    }
 
     private fun extractServerUrls(html: String): List<String> {
         val out = linkedSetOf<String>()
@@ -181,36 +193,78 @@ class ExYuTeka : MainAPI() {
         return out.filterNot { isJunk(it) }.toSet()
     }
 
+    // FIX zurück: title-Scan + mkv/webm, Auflösung gegen die ECHTE Player-Domain
     private suspend fun directVideos(doc: Document, rawHtml: String, pageUrl: String, label: String, emitted: MutableSet<String>, callback: (ExtractorLink) -> Unit): Boolean {
         val html = unpack(rawHtml)
         var found = false
         val cands = linkedSetOf<String>()
+
         doc.select("video source, video").forEach { val s = it.attr("src").ifEmpty { it.attr("data-src") }; if (s.isNotEmpty()) cands.add(s) }
+        doc.select("title").forEach {
+            val t = it.text().trim()
+            if (t.endsWith(".mkv", true) || t.endsWith(".mp4", true) || t.endsWith(".webm", true)) cands.add(t)
+        }
+
         listOf(
             Regex("""["'](https?://[^"'\s]+\.m3u8[^"'\s]*)["']"""),
-            Regex("""["'](https?://[^"'\s]+\.mp4[^"'\s]*)["']"""),
-            Regex("""["'](/[^"'\s]+\.mp4[^"'\s]*)["']"""),
+            Regex("""["'](https?://[^"'\s]+\.(?:mp4|mkv|webm)[^"'\s]*)["']"""),
+            Regex("""["'](/[^"'\s]+\.(?:mp4|mkv|webm|m3u8)[^"'\s]*)["']"""),
+            Regex("""["']([a-zA-Z0-9_\-\.]+\.(?:mp4|mkv|webm|m3u8))["']"""),
             Regex("""(?:file|src|source|video_url|videoUrl|hls)\s*[:=]\s*["']([^"']+)["']""")
         ).forEach { r -> r.findAll(html).forEach { cands.add(it.groupValues[1]) } }
+
         for (raw in cands) {
-            val u = fixUrl(raw.replace("\\/", "/").trim())
+            val u = resolveUrl(pageUrl, raw)
             if (u.isEmpty() || u.startsWith("blob:") || isJunk(u)) continue
             if (u.contains(".php") || u.contains("/watch") || u.contains("/embed/")) continue
-            val clean = u.substringBefore("?")
-            val isM3u8 = clean.endsWith(".m3u8") || u.contains(".m3u8")
-            val isMp4 = clean.endsWith(".mp4") || u.contains("/video/") || u.contains("cdn.dsplayer")
-            if (!isM3u8 && !isMp4) continue
+            val ext = fileExt(u)
+            val isM3u8 = ext == "m3u8"
+            val isDirect = ext in listOf("mp4", "mkv", "webm") || u.contains("/video/") || u.contains("cdn.dsplayer")
+            if (!isM3u8 && !isDirect) continue
             if (!emitted.add(u)) continue
+
             val ref = if (u.contains("dsplayer")) "https://dsplayer.site/" else pageUrl
             val q = when { u.contains("1080") -> Qualities.P1080.value; u.contains("720") -> Qualities.P720.value; u.contains("480") -> Qualities.P480.value; else -> Qualities.P1080.value }
-            dbg("DIRECT VIDEO: $u")
-            callback(newExtractorLink(source = this.name, name = label, url = u, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) { this.referer = ref; this.quality = q })
+            dbg("DIRECT VIDEO [$ext]: $u")
+            callback(newExtractorLink(source = this.name, name = "$label [$ext]", url = u, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) { this.referer = ref; this.quality = q })
             found = true
         }
         return found
     }
 
     private suspend fun renameLink(link: ExtractorLink, label: String): ExtractorLink = newExtractorLink(source = this.name, name = "$label (${link.name})", url = link.url, type = link.type) { this.referer = link.referer; this.quality = link.quality; this.headers = link.headers; this.extractorData = link.extractorData }
+
+    // Generic Scraper zurück: folgt Redirects + iframes, nutzt title-Scan gegen echte Domain
+    private suspend fun genericMedia(url: String, referer: String, label: String, visited: MutableSet<String>, emitted: MutableSet<String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        var ok = false
+        try {
+            val resp = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
+            val finalPage = resp.url.ifEmpty { url }
+            dbg("GENERIC ${urlBase(finalPage).substringAfter("//")} (${resp.text.length} Zeichen)")
+            if (directVideos(resp.document, resp.text, finalPage, label, emitted, callback)) ok = true
+
+            val iframes = resp.document.select("iframe")
+                .map { it.attr("src").ifEmpty { it.attr("data-src") } }
+                .filter { it.isNotEmpty() }
+                .map { fixUrl(it) }
+                .filterNot { isJunk(it) || it == url || visited.contains(it) }
+
+            for (f in iframes.take(4)) {
+                visited.add(f)
+                val col = mutableListOf<ExtractorLink>()
+                try { loadExtractor(f, finalPage, subtitleCallback) { col.add(it) } } catch (_: Exception) {}
+                if (col.isNotEmpty()) {
+                    col.forEach { link -> callback(renameLink(link, label)); ok = true }
+                    continue
+                }
+                try {
+                    val r2 = app.get(f, headers = mapOf("User-Agent" to userAgent, "Referer" to finalPage))
+                    if (directVideos(r2.document, r2.text, r2.url.ifEmpty { f }, label, emitted, callback)) ok = true
+                } catch (_: Exception) {}
+            }
+        } catch (e: Exception) { dbg("GENERIC Fehler: ${e.message?.take(50)}") }
+        return ok
+    }
 
     private suspend fun handleServer(url: String, referer: String, label: String, visited: MutableSet<String>, emitted: MutableSet<String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         if (isJunk(url)) return
@@ -231,30 +285,30 @@ class ExYuTeka : MainAPI() {
 
         if (!visited.add(url)) return
 
-        if (url.contains("exyuvid", true)) {
-            dbg("EXYU: $url")
-            try {
-                val r = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                val finalUrl = r.url.ifEmpty { url }
-                if (directVideos(r.document, r.text, finalUrl, "$name - EXYU", emitted, callback)) return
-            } catch (_: Exception) {}
+        // Byse/Filemoon: eigener Extractor crasht -> nur generic, KEIN loadExtractor
+        if (url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
+            genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
             return
         }
 
-        // ABYS/FILEMOON/BYSE deaktiviert (CDN-URL nicht bekannt / API zu komplex)
-        if (url.contains("abyss", true) || url.contains("abyssplayer", true) || 
-            url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
-            dbg("ÜBERSPRUNGEN: $url")
+        // Abyss: erst Cloudstream-Extractor, dann generic (Auflösung gegen Abyss-Domain)
+        if (url.contains("abyss", true) || url.contains("abyssplayer", true)) {
+            val collected = mutableListOf<ExtractorLink>()
+            try { loadExtractor(url, referer, subtitleCallback) { collected.add(it) } } catch (_: Exception) {}
+            if (collected.isNotEmpty()) { dbg("ABYS OK: ${collected.size}"); collected.forEach { link -> callback(renameLink(link, label)) }; return }
+            genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
             return
         }
 
-        // Andere Hoster (Minochinos, Streamtape, etc.)
+        // Alle anderen (Streamtape, Minochinos, VidHide, ...)
         val collected = mutableListOf<ExtractorLink>()
         try {
             val extReferer = if (url.contains("minochinos", true) || url.contains("vidhide", true)) referer else "$mainUrl/"
             loadExtractor(url, extReferer, subtitleCallback) { collected.add(it) }
         } catch (_: Exception) {}
         if (collected.isNotEmpty()) { dbg("EXTRACTOR OK: ${collected.size}"); collected.forEach { link -> callback(renameLink(link, label)) }; return }
+
+        genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
