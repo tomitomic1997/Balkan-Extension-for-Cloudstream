@@ -160,11 +160,6 @@ class ExYuTeka : MainAPI() {
     private fun urlCode(u: String): String = u.substringAfter("://").substringAfter("/", "").substringBefore("?").substringBefore("#").trimEnd('/').substringAfterLast("/")
     private fun unpack(html: String): String { val plain = html.replace("\\/", "/"); return try { if (plain.contains("eval(function(p,a,c,k,e,")) getAndUnpack(plain).replace("\\/", "/") else plain } catch (_: Exception) { plain } }
 
-    private fun fileExt(u: String): String {
-        val clean = u.substringBefore("?").substringBefore("#")
-        return clean.substringAfterLast(".", "bin").lowercase()
-    }
-
     private fun extractServerUrls(html: String): List<String> {
         val out = linkedSetOf<String>()
         Regex("""case\s+\d+\s*:\s*src\s*=\s*["']([^"']+)["']""").findAll(html).forEach { out.add(it.groupValues[1].trim()) }
@@ -191,30 +186,25 @@ class ExYuTeka : MainAPI() {
         var found = false
         val cands = linkedSetOf<String>()
         doc.select("video source, video").forEach { val s = it.attr("src").ifEmpty { it.attr("data-src") }; if (s.isNotEmpty()) cands.add(s) }
-        doc.select("title").forEach {
-            val t = it.text().trim()
-            if (t.endsWith(".mkv", true) || t.endsWith(".mp4", true) || t.endsWith(".webm", true)) cands.add(t)
-        }
         listOf(
             Regex("""["'](https?://[^"'\s]+\.m3u8[^"'\s]*)["']"""),
-            Regex("""["'](https?://[^"'\s]+\.(?:mp4|mkv|webm)[^"'\s]*)["']"""),
-            Regex("""["'](/[^"'\s]+\.(?:mp4|mkv|webm|m3u8)[^"'\s]*)["']"""),
-            Regex("""["']([a-zA-Z0-9_\-\.]+\.(?:mp4|mkv|webm|m3u8))["']"""),
+            Regex("""["'](https?://[^"'\s]+\.mp4[^"'\s]*)["']"""),
+            Regex("""["'](/[^"'\s]+\.mp4[^"'\s]*)["']"""),
             Regex("""(?:file|src|source|video_url|videoUrl|hls)\s*[:=]\s*["']([^"']+)["']""")
         ).forEach { r -> r.findAll(html).forEach { cands.add(it.groupValues[1]) } }
         for (raw in cands) {
             val u = fixUrl(raw.replace("\\/", "/").trim())
             if (u.isEmpty() || u.startsWith("blob:") || isJunk(u)) continue
             if (u.contains(".php") || u.contains("/watch") || u.contains("/embed/")) continue
-            val ext = fileExt(u)
-            val isM3u8 = ext == "m3u8"
-            val isDirect = ext in listOf("mp4", "mkv", "webm") || u.contains("/video/") || u.contains("cdn.dsplayer")
-            if (!isM3u8 && !isDirect) continue
+            val clean = u.substringBefore("?")
+            val isM3u8 = clean.endsWith(".m3u8") || u.contains(".m3u8")
+            val isMp4 = clean.endsWith(".mp4") || u.contains("/video/") || u.contains("cdn.dsplayer")
+            if (!isM3u8 && !isMp4) continue
             if (!emitted.add(u)) continue
             val ref = if (u.contains("dsplayer")) "https://dsplayer.site/" else pageUrl
             val q = when { u.contains("1080") -> Qualities.P1080.value; u.contains("720") -> Qualities.P720.value; u.contains("480") -> Qualities.P480.value; else -> Qualities.P1080.value }
-            dbg("DIRECT VIDEO [$ext]: $u")
-            callback(newExtractorLink(source = this.name, name = "$label [$ext]", url = u, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) { this.referer = ref; this.quality = q })
+            dbg("DIRECT VIDEO: $u")
+            callback(newExtractorLink(source = this.name, name = label, url = u, type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) { this.referer = ref; this.quality = q })
             found = true
         }
         return found
@@ -241,54 +231,20 @@ class ExYuTeka : MainAPI() {
 
         if (!visited.add(url)) return
 
-        // EXYU-Player: Redirect folgen
         if (url.contains("exyuvid", true)) {
             dbg("EXYU: $url")
             try {
                 val r = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
                 val finalUrl = r.url.ifEmpty { url }
-                val ext = fileExt(finalUrl)
-                if (ext in listOf("mp4", "mkv", "webm", "m3u8")) {
-                    if (emitted.add(finalUrl)) {
-                        dbg("EXYU REDIRECT -> [$ext] $finalUrl")
-                        callback(newExtractorLink(source = this.name, name = "$name - EXYU [$ext]", url = finalUrl, type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                            this.referer = "$mainUrl/"
-                            this.quality = Qualities.P1080.value
-                        })
-                    }
-                    return
-                }
                 if (directVideos(r.document, r.text, finalUrl, "$name - EXYU", emitted, callback)) return
             } catch (_: Exception) {}
             return
         }
 
-        // ABYS: Direkt MP4-URL mit ExYuTeka-Referer (gegen 2004-Fehler)
-        if (url.contains("abyss", true) || url.contains("abyssplayer", true)) {
-            dbg("ABYS: $url")
-            try {
-                val r = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                val finalUrl = r.url.ifEmpty { url }
-                val ext = fileExt(finalUrl)
-                if (ext in listOf("mp4", "mkv", "webm", "m3u8")) {
-                    if (emitted.add(finalUrl)) {
-                        dbg("ABYS DIRECT [$ext]: $finalUrl")
-                        callback(newExtractorLink(source = this.name, name = "$name - ABYS [$ext]", url = finalUrl, type = if (ext == "m3u8") ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                            this.referer = "$mainUrl/"
-                            this.quality = Qualities.P1080.value
-                            this.headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")
-                        })
-                    }
-                    return
-                }
-                if (directVideos(r.document, r.text, finalUrl, "$name - ABYS", emitted, callback)) return
-            } catch (_: Exception) {}
-            return
-        }
-
-        // BYSE/FILEMOON: Nicht unterstützt (API zu komplex)
-        if (url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
-            dbg("BYSE/FILEMOON: Nicht unterstützt")
+        // ABYS/FILEMOON/BYSE deaktiviert (CDN-URL nicht bekannt / API zu komplex)
+        if (url.contains("abyss", true) || url.contains("abyssplayer", true) || 
+            url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
+            dbg("ÜBERSPRUNGEN: $url")
             return
         }
 
