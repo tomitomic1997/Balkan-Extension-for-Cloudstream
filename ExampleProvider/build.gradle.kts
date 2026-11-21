@@ -1,4 +1,4 @@
-version = 3
+version = 1
 
 cloudstream {
     description = "ExYuTeka - Filmovi i serije sa Balkana"
