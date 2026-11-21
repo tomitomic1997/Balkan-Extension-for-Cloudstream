@@ -505,8 +505,6 @@ class ExYuTeka : MainAPI() {
         return null
     }
 
-    // ---------- Mini-JSON-Builder (keine Serializer-Abhängigkeit) ----------
-
     private fun toJson(v: Any?): String = when (v) {
         null -> "null"
         is String -> "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
@@ -843,6 +841,13 @@ class ExYuTeka : MainAPI() {
         var ok = false
         try {
             val resp = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
+            dbg("GENERIC ${resp.url} (${resp.text.length} Zeichen)")
+
+            // NEU: externe URLs der Seite loggen (zeigt uns z.B. die Abys-API)
+            val extern = collectCandidates(resp.document, resp.text)
+                .filterNot { isOwnSite(it) || it == url || it == resp.url }
+            dbg("GENERIC extern (${extern.size}): ${extern.take(8).joinToString(" | ")}")
+
             if (directVideos(resp.document, resp.text, url, label, emitted, callback)) ok = true
 
             val iframes = resp.document.select("iframe")
@@ -887,23 +892,22 @@ class ExYuTeka : MainAPI() {
         if (isJunk(url)) return
         dbg("SERVER: $url")
 
-        // DSServer: Haupt-URL DIREKT abrufen (kein visited-Gate!), dann Varianten
+        // DSServer: ERSTE funktionierende Variante gewinnt, keine Duplikate mehr
         if (url.contains("dsplayer.site")) {
-            runCatching {
-                val r = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                directVideos(r.document, r.text, url, "$name - DSServer", emitted, callback)
-            }
-            for (variant in listOf(
+            var dsOk = false
+            val variants = listOf(
+                url,
                 url.replace("/embed2/video.php?slug=", "/watch.php?v=") + ".mp4",
-                url.replace("/embed2/video.php?slug=", "/watch.php?v="),
-                url.replace("/embed2/video.php?slug=", "/video.php?slug=")
-            )) {
-                if (!visited.add(variant)) continue
-                runCatching {
+                url.replace("/embed2/video.php?slug=", "/watch.php?v=")
+            )
+            for (variant in variants) {
+                if (dsOk) break
+                try {
                     val r = app.get(variant, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                    directVideos(r.document, r.text, variant, "$name - DSServer", emitted, callback)
-                }
+                    if (directVideos(r.document, r.text, variant, "$name - DSServer", emitted, callback)) dsOk = true
+                } catch (_: Exception) {}
             }
+            visited.add(url)
             return
         }
 
@@ -957,7 +961,6 @@ class ExYuTeka : MainAPI() {
                     }
                 }
 
-            // Backup: externe URLs direkt von der Hauptseite
             if (serverUrls.isEmpty()) {
                 serverUrls.addAll(mainCands.filterNot { isOwnSite(it) }.take(10))
             }
@@ -975,27 +978,28 @@ class ExYuTeka : MainAPI() {
                 }
             }
 
-            // DSServer-Slug-Fallback (immer, als Sicherheitsnetz)
-            val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
-            val slugs = mutableSetOf<String>()
-            if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
-            serverUrls.forEach { u ->
-                Regex("""[?&](?:search|v|slug|film)=([^&"'\s<>\\]+)""").findAll(u).forEach {
-                    slugs.add(it.groupValues[1].removeSuffix(".mp4").trim())
+            // DSServer-Slug-Fallback NUR wenn bisher kein DSServer-Link gefunden wurde
+            if (emitted.none { it.contains("dsplayer") }) {
+                val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
+                val slugs = mutableSetOf<String>()
+                if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
+                serverUrls.forEach { u ->
+                    Regex("""[?&](?:search|v|slug|film)=([^&"'\s<>\\]+)""").findAll(u).forEach {
+                        slugs.add(it.groupValues[1].removeSuffix(".mp4").trim())
+                    }
                 }
-            }
-            for (slug in slugs) {
-                val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
-                for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
-                    for (dsUrl in listOf(
-                        "https://dsplayer.site/watch.php?v=$s.mp4",
-                        "https://dsplayer.site/watch.php?v=$s",
-                        "https://dsplayer.site/embed2/video.php?slug=$s"
-                    )) {
-                        if (!visited.add(dsUrl)) continue
-                        runCatching {
-                            val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                            directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)
+                outer@ for (slug in slugs) {
+                    val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
+                    for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
+                        for (dsUrl in listOf(
+                            "https://dsplayer.site/watch.php?v=$s.mp4",
+                            "https://dsplayer.site/embed2/video.php?slug=$s"
+                        )) {
+                            if (!visited.add(dsUrl)) continue
+                            runCatching {
+                                val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+                                if (directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)) break@outer
+                            }
                         }
                     }
                 }
