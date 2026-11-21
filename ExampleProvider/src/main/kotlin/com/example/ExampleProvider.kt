@@ -134,7 +134,6 @@ class ExYuTeka : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim().lowercase()
         
-        // Abfangen von Kategorie-Suchen (User tippen oft "film" oder "serien" ins Suchfeld)
         val categoryMap = mapOf(
             "serije" to "$mainUrl/serije.php",
             "serien" to "$mainUrl/serije.php",
@@ -164,7 +163,6 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // Normale Suche mit korrektem URL-Encoding für Sonderzeichen (č, ć, š, ž, đ)
         val encodedQuery = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
         val searchUrl = "$mainUrl/pretraga.php?q=$encodedQuery"
         
@@ -400,7 +398,7 @@ class ExYuTeka : MainAPI() {
 
         document.select("[data-src], [data-url], [data-embed]").forEach { elem ->
             val u = elem.attr("data-src").ifEmpty { elem.attr("data-url").ifEmpty { elem.attr("data-embed") } }
-            if (u.contains("embed") || u.contains("php") || u.contains("dsplayer") || u.contains("streamtape")) {
+            if (u.contains("embed") || u.contains("php") || u.contains("dsplayer") || u.contains("streamtape") || u.contains("filemoon") || u.contains("voe")) {
                 embedUrls.add(fixUrl(u))
             }
         }
@@ -463,13 +461,41 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // 2. Server-Tabs nach DSServer und StreamTape durchsuchen
+        // Regex-Muster für alle bekannten Hoster (Filemoon, Voe, Streamtape, Doodstream, etc.)
+        val hosterPatterns = listOf(
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/[ve]/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/[ve]/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/[ve]/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/[a-zA-Z0-9_-/]+)""")
+        )
+
+        // 2. Server-Tabs durchsuchen (DSServer, StreamTape, Filemoon, Voe etc.)
         for (sUrl in serverUrls) {
             if (!visitedUrls.add(sUrl)) continue
             try {
                 val sroResponse = app.get(sUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
                 val sroDoc = sroResponse.document
                 val sroHtml = sroResponse.text
+
+                // JS Entpacker für verschlüsselte Embed-URLs
+                val unpackedHtml = if (sroHtml.contains("eval(function(p,a,c,k,e,")) {
+                    try { getAndUnpack(sroHtml) } catch (_: Exception) { sroHtml }
+                } else {
+                    sroHtml
+                }
+
+                // Hoster-URLs per Regex im entpackten HTML finden
+                for (pattern in hosterPatterns) {
+                    for (match in pattern.findAll(unpackedHtml)) {
+                        val url = match.groupValues[1]
+                        if (visitedUrls.add(url)) {
+                            try {
+                                loadExtractor(url, sUrl, subtitleCallback, callback)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
 
                 val potentialLinks = mutableSetOf<String>()
 
@@ -493,7 +519,7 @@ class ExYuTeka : MainAPI() {
                     }
                 }
 
-                Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"'<>\\]+""").findAll(sroHtml.replace("\\/", "/")).forEach { m ->
+                Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s"'<>\\]+""").findAll(unpackedHtml.replace("\\/", "/")).forEach { m ->
                     potentialLinks.add(m.value)
                 }
 
@@ -509,7 +535,8 @@ class ExYuTeka : MainAPI() {
                         }
                     }
 
-                    if (candUrl.contains("streamtape") && visitedUrls.add(candUrl)) {
+                    // Zusätzlicher Fallback für bekannte Hoster über loadExtractor
+                    if (candUrl.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(candUrl)) {
                         try {
                             loadExtractor(candUrl, sUrl, subtitleCallback, callback)
                         } catch (_: Exception) {}
@@ -518,9 +545,9 @@ class ExYuTeka : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // 3. Direkte StreamTape-Links auf der Hauptseite
+        // 3. Direkte Hoster-Links auf der Hauptseite
         for (u in embedUrls) {
-            if (u.contains("streamtape") && visitedUrls.add(u)) {
+            if (u.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(u)) {
                 try {
                     loadExtractor(u, data, subtitleCallback, callback)
                 } catch (_: Exception) {}
