@@ -8,9 +8,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-class ExYouTeka : MainAPI() {
+class ExYuTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
-    override var name = "ExYouTeka"
+    override var name = "ExYuTeka"
     override val hasMainPage = true
     override var lang = "un"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
@@ -189,7 +189,7 @@ class ExYouTeka : MainAPI() {
             }
         }
 
-        val title = document.selectFirst(".single-title, h1, .title")?.text()?.trim() ?: "ExYouTeka"
+        val title = document.selectFirst(".single-title, h1, .title")?.text()?.trim() ?: "ExYuTeka"
         val posterImg = document.selectFirst(".single-poster img, .poster img, img[src*='/slika'], .movie-poster img, .entry-poster img")
         val posterUrl = fixUrlNull(
             posterImg?.attr("data-src")?.ifEmpty { null }
