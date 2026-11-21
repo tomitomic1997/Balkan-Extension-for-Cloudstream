@@ -3,6 +3,7 @@
 package com.example
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -25,6 +26,10 @@ class ExYuTeka : MainAPI() {
         "User-Agent" to userAgent,
         "Referer" to "$mainUrl/"
     )
+
+    private fun dbg(msg: String) {
+        Log.d("ExYuTeka", msg)
+    }
 
     override val mainPage = mainPageOf(
         "$mainUrl/#trending-filmovi" to "Trending Filmovi",
@@ -152,7 +157,7 @@ class ExYuTeka : MainAPI() {
         return emptyList()
     }
 
-    // ------------------------------------------------------------------ Details / Episoden
+    // ------------------------------------------------------------------ Details
 
     override suspend fun load(url: String): LoadResponse {
         var targetUrl = url
@@ -256,9 +261,10 @@ class ExYuTeka : MainAPI() {
     // ------------------------------------------------------------------ Helfer
 
     private val junkWords = listOf(
-        "googletag", "managertechnically", "al5sm", "doubleclick", "googletagmanager",
+        "googletag", "managertechnically", "al5sm", "aarems", "doubleclick", "googletagmanager",
         "google-analytics", "gstatic", "googleapis", "fonts.", "histats", "exoclick",
-        "popads", "juicyads", "adsco", "favicon", "placeholder", "facebook.com", "twitter.com"
+        "popads", "juicyads", "adsco", "favicon", "placeholder", "facebook.com", "twitter.com",
+        "clickonserver", "challenge-platform", "cdn-cgi"
     )
 
     private fun isJunk(url: String): Boolean {
@@ -288,6 +294,18 @@ class ExYuTeka : MainAPI() {
         } catch (_: Exception) { plain }
     }
 
+    /** Liest die Server-URLs aus der JavaScript-Switch-Funktion (case N: src = "...") */
+    private fun extractServerUrls(html: String): List<String> {
+        val out = linkedSetOf<String>()
+        Regex("""case\s+\d+\s*:\s*src\s*=\s*["']([^"']+)["']""").findAll(html).forEach {
+            out.add(it.groupValues[1].trim())
+        }
+        Regex("""\bsrc\s*=\s*["'](https?://[^"']+)["']""").findAll(html).forEach {
+            out.add(it.groupValues[1].trim())
+        }
+        return out.filterNot { isJunk(it) }.toList()
+    }
+
     private fun collectCandidates(doc: Document, rawHtml: String): Set<String> {
         val html = unpack(rawHtml)
         val out = linkedSetOf<String>()
@@ -303,30 +321,13 @@ class ExYuTeka : MainAPI() {
         doc.select("iframe, frame, embed, source, video").forEach {
             add(it.attr("src")); add(it.attr("data-src"))
         }
-        doc.select("[data-src], [data-url], [data-embed], [data-play-url], [data-server], [data-link], [data-file]")
-            .forEach { el ->
-                listOf("data-src", "data-url", "data-embed", "data-play-url", "data-server", "data-link", "data-file")
-                    .forEach { add(el.attr(it)) }
-            }
         doc.select("a[href]").forEach { add(it.attr("href")) }
-
-        val jsTargets = Regex("""(?:\.src|location(?:\.href)?|window\.open)\s*(?:=|\()\s*["']([^"']+)["']""")
-        jsTargets.findAll(html).forEach { add(it.groupValues[1]) }
-        doc.select("[onclick]").forEach { el ->
-            jsTargets.findAll(el.attr("onclick")).forEach { add(it.groupValues[1]) }
-            Regex("""["']([^"']*(?:\.php|/e/|/embed/|/v/)[^"']*)["']""")
-                .findAll(el.attr("onclick")).forEach { add(it.groupValues[1]) }
-        }
-        doc.select("meta[http-equiv=refresh]").forEach { m ->
-            Regex("""url\s*=\s*['"]?([^'";]+)""", RegexOption.IGNORE_CASE)
-                .find(m.attr("content"))?.let { add(it.groupValues[1]) }
-        }
-        Regex("""["'](/(?:embed|exyuvid|player|video)[^"'\s<>]*)["']""").findAll(html).forEach { add(it.groupValues[1]) }
         Regex("""https?://[^\s"'<>\\)\]}]+""").findAll(html).forEach { add(it.value) }
 
         return out.filterNot { isJunk(it) }.toSet()
     }
 
+    /** Findet direkte mp4/m3u8-Links (auch in entpacktem JWPlayer-Code) */
     private suspend fun directVideos(
         doc: Document, rawHtml: String, pageUrl: String, label: String,
         emitted: MutableSet<String>, callback: (ExtractorLink) -> Unit
@@ -349,7 +350,7 @@ class ExYuTeka : MainAPI() {
         for (raw in cands) {
             val u = fixUrl(raw.replace("\\/", "/").trim())
             if (u.isEmpty() || u.startsWith("blob:") || isJunk(u)) continue
-            if (u.contains(".php") || u.contains("/watch") || u.contains("/embed")) continue
+            if (u.contains(".php") || u.contains("/watch") || u.contains("/embed/")) continue
             val clean = u.substringBefore("?")
             val isM3u8 = clean.endsWith(".m3u8") || u.contains(".m3u8")
             val isMp4 = clean.endsWith(".mp4") || u.contains("/video/") || u.contains("cdn.dsplayer")
@@ -363,6 +364,7 @@ class ExYuTeka : MainAPI() {
                 u.contains("480") -> Qualities.P480.value
                 else -> Qualities.P1080.value
             }
+            dbg("DIRECT VIDEO: $u")
             callback(newExtractorLink(
                 source = this.name, name = label, url = u,
                 type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -375,7 +377,7 @@ class ExYuTeka : MainAPI() {
         return found
     }
 
-    // ------------------------------------------- Byse (ehemals Filemoon) Extractor
+    // ------------------------------------------- Byse (ehemals Filemoon), eigener AES-Extractor
 
     private fun b64UrlDecode(s: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
@@ -393,19 +395,13 @@ class ExYuTeka : MainAPI() {
         val code = urlCode(embedUrl)
         if (code.length < 4) return false
 
+        dbg("BYSE: $embedUrl")
         try {
-            // WICHTIG: Wir geben vor, dass die Anfrage von ExYuTeka kommt!
-            val apiHeaders = mapOf(
-                "User-Agent" to userAgent,
-                "Referer" to "https://exyuteka.net/",
-                "Origin" to "https://exyuteka.net",
-                "Accept" to "application/json, text/plain, */*"
-            )
-
             val detailsText = app.get(
                 "$base/api/videos/$code/embed/details",
-                headers = apiHeaders
+                headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/")
             ).text.replace("\\/", "/")
+            dbg("BYSE details: ${detailsText.take(160)}")
 
             val frameUrl = Regex(""""embed_frame_url"\s*:\s*"([^"]+)"""")
                 .find(detailsText)?.groupValues?.get(1) ?: return false
@@ -413,16 +409,13 @@ class ExYuTeka : MainAPI() {
             val embedBase = urlBase(frameUrl)
             val embedCode = urlCode(frameUrl)
 
-            // Auch der Playback-Request braucht den korrekten Referer
             val pbText = app.get(
                 "$embedBase/api/videos/$embedCode/embed/playback",
                 headers = mapOf(
                     "User-Agent" to userAgent,
-                    "Accept" to "*/*",
-                    "Accept-Language" to "en-US,en;q=0.5",
-                    "Referer" to "https://exyuteka.net/",
-                    "Origin" to "https://exyuteka.net",
-                    "X-Embed-Parent" to "https://exyuteka.net/"
+                    "accept" to "*/*",
+                    "referer" to frameUrl,
+                    "x-embed-parent" to embedUrl
                 )
             ).text
 
@@ -430,17 +423,19 @@ class ExYuTeka : MainAPI() {
                 ?: return false
             val parts = Regex(""""([^"]+)"""").findAll(partsBlock).map { it.groupValues[1] }.toList()
             if (parts.size < 2) return false
-
             val ivStr = Regex(""""iv"\s*:\s*"([^"]+)"""").find(pbText)?.groupValues?.get(1) ?: return false
             val payloadStr = Regex(""""payload"\s*:\s*"([^"]+)"""").find(pbText)?.groupValues?.get(1) ?: return false
 
             val keyBytes = b64UrlDecode(parts[0]) + b64UrlDecode(parts[1])
-            val ivBytes = b64UrlDecode(ivStr)
-            val cipherBytes = b64UrlDecode(payloadStr)
-
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, ivBytes))
-            val plain = cipher.doFinal(cipherBytes).decodeToString().removePrefix("\uFEFF").replace("\\/", "/")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(keyBytes, "AES"),
+                GCMParameterSpec(128, b64UrlDecode(ivStr))
+            )
+            val plain = cipher.doFinal(b64UrlDecode(payloadStr)).decodeToString()
+                .removePrefix("\uFEFF").replace("\\/", "/")
+            dbg("BYSE entschlüsselt: ${plain.length} Zeichen")
 
             var found = false
             Regex("""\{[^{}]*\}""").findAll(plain).forEach { m ->
@@ -448,214 +443,193 @@ class ExYuTeka : MainAPI() {
                 val u = Regex(""""url"\s*:\s*"([^"]+)"""").find(obj)?.groupValues?.get(1) ?: return@forEach
                 if (!u.startsWith("http")) return@forEach
                 if (!emitted.add(u)) return@forEach
-
                 val h = Regex(""""height"\s*:\s*(\d+)""").find(obj)?.groupValues?.get(1)?.toIntOrNull()
                 val lbl = Regex(""""label"\s*:\s*"([^"]+)"""").find(obj)?.groupValues?.get(1)
                 val isM3u8 = u.contains(".m3u8") || obj.contains("mpegurl", true) || obj.contains("hls", true)
 
+                dbg("BYSE LINK: $u")
                 callback(newExtractorLink(
                     source = this.name,
                     name = "$name - Byse" + (lbl?.let { " $it" } ?: h?.let { " ${it}p" } ?: ""),
                     url = u,
                     type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = "https://exyuteka.net/"
+                    this.referer = "$embedBase/"
                     this.quality = h ?: Qualities.P1080.value
-                    this.headers = mapOf("Referer" to "https://exyuteka.net/", "User-Agent" to userAgent)
+                    this.headers = mapOf("Referer" to "$embedBase/", "User-Agent" to userAgent)
                 })
                 found = true
             }
             return found
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            dbg("BYSE Fehler: ${e.message}")
             return false
         }
     }
 
-    /** Cloudstreams Extractoren; Links werden gesammelt und danach umbenannt (suspend-sicher). */
-    private suspend fun tryHoster(
-        url: String,
-        referer: String,
-        label: String,
-        visited: MutableSet<String>,
-        emitted: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+    private suspend fun renameLink(link: ExtractorLink, label: String): ExtractorLink =
+        newExtractorLink(
+            source = this.name,
+            name = "$label (${link.name})",
+            url = link.url,
+            type = link.type
+        ) {
+            this.referer = link.referer
+            this.quality = link.quality
+            this.headers = link.headers
+            this.extractorData = link.extractorData
+        }
+
+    /** Generischer Scraper: holt die Seite, entpackt JWPlayer, folgt iframes (1 Ebene) */
+    private suspend fun genericMedia(
+        url: String, referer: String, label: String,
+        visited: MutableSet<String>, emitted: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var ok = false
+        try {
+            val resp = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer))
+            if (directVideos(resp.document, resp.text, url, label, emitted, callback)) ok = true
+
+            val iframes = resp.document.select("iframe")
+                .map { it.attr("src").ifEmpty { it.attr("data-src") } }
+                .filter { it.isNotEmpty() }
+                .map { fixUrl(it) }
+                .filterNot { isJunk(it) || it == url || visited.contains(it) }
+
+            for (f in iframes.take(4)) {
+                visited.add(f)
+                if (f.contains("byse", true) || f.contains("filemoon", true)) {
+                    if (parseByse(f, emitted, callback)) ok = true
+                    continue
+                }
+                val col = mutableListOf<ExtractorLink>()
+                try { loadExtractor(f, url, subtitleCallback) { col.add(it) } } catch (_: Exception) {}
+                col.forEach { link -> callback(renameLink(link, label)); ok = true }
+                if (col.isEmpty()) {
+                    try {
+                        val r2 = app.get(f, headers = mapOf("User-Agent" to userAgent, "Referer" to url))
+                        if (directVideos(r2.document, r2.text, f, label, emitted, callback)) ok = true
+                    } catch (_: Exception) {}
+                }
+            }
+
+            if (!ok && resp.url != url &&
+                (resp.url.contains("byse", true) || resp.url.contains("filemoon", true))
+            ) {
+                if (parseByse(resp.url, emitted, callback)) ok = true
+            }
+        } catch (e: Exception) {
+            dbg("GENERIC Fehler $url: ${e.message}")
+        }
+        return ok
+    }
+
+    /** Behandelt eine Server-URL aus dem Switch: DSServer / Byse / Extractor / generisch */
+    private suspend fun handleServer(
+        url: String, referer: String, label: String,
+        visited: MutableSet<String>, emitted: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         if (isJunk(url) || !visited.add(url)) return
+        dbg("SERVER: $url")
 
-        if (url.contains("byse", true) || url.contains("filemoon", true)) {
+        if (url.contains("dsplayer.site")) {
+            for (variant in listOf(url, url.replace("/embed2/video.php?slug=", "/watch.php?v=") + ".mp4")) {
+                if (!visited.add(variant)) continue
+                try {
+                    val r = app.get(variant, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+                    directVideos(r.document, r.text, variant, "$name - DSServer", emitted, callback)
+                } catch (_: Exception) {}
+            }
+            return
+        }
+
+        if (url.contains("byse", true) || url.contains("filemoon", true) || url.contains("moonplayer", true)) {
             if (parseByse(url, emitted, callback)) return
         }
 
         val collected = mutableListOf<ExtractorLink>()
-        val collect: (ExtractorLink) -> Unit = { collected.add(it) }
-        var resolved = url
-
-        try {
-            resolved = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to referer)).url
-                .ifEmpty { url }
-            if (resolved != url && !isOwnSite(resolved) && visited.add(resolved)) {
-                loadExtractor(resolved, referer, subtitleCallback, collect)
-            }
-            loadExtractor(url, referer, subtitleCallback, collect)
-        } catch (_: Exception) {
-            try { loadExtractor(url, referer, subtitleCallback, collect) } catch (_: Exception) {}
+        try { loadExtractor(url, referer, subtitleCallback) { collected.add(it) } } catch (_: Exception) {}
+        if (collected.isNotEmpty()) {
+            dbg("EXTRACTOR OK: $url (${collected.size})")
+            collected.forEach { link -> callback(renameLink(link, label)) }
+            return
         }
 
-        // Umbenennen erst HIER (wir sind wieder im suspend-Kontext)
-        collected.forEach { link ->
-            callback(newExtractorLink(
-                source = this.name,
-                name = "$label (${link.name})",
-                url = link.url,
-                type = link.type
-            ) {
-                this.referer = link.referer
-                this.quality = link.quality
-                this.headers = link.headers
-                this.extractorData = link.extractorData
-            })
-        }
-
-        // Kein Extractor hat gepasst -> Byse-API versuchen (unbekannte Mirrors wie n1mwq.org)
-        if (collected.isEmpty()) {
-            if (!parseByse(resolved, emitted, callback) && resolved != url) {
-                parseByse(url, emitted, callback)
-            }
-        }
+        genericMedia(url, referer, label, visited, emitted, subtitleCallback, callback)
     }
 
     // ------------------------------------------------------------------ loadLinks
 
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        data: String, isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         var foundAny = false
         val visited = mutableSetOf<String>()
         val emitted = mutableSetOf<String>()
         val wrapped: (ExtractorLink) -> Unit = { foundAny = true; callback(it) }
 
-        fun priority(u: String) = when {
-            u.contains("byse", true) || u.contains("filemoon", true) -> 4
-            u.contains("/e/") || u.contains("/embed/") -> 3
-            Regex("""/[a-z0-9]{3,}/[a-z0-9]{6,}""", RegexOption.IGNORE_CASE).containsMatchIn(u) -> 2
-            else -> 1
-        }
-
+        dbg("=== LOADLINKS: $data ===")
         val page = app.get(data, headers = headers)
-        val mainCandidates = collectCandidates(page.document, page.text)
+        val serverUrls = linkedSetOf<String>()
+        serverUrls.addAll(extractServerUrls(page.text))
 
-        // 1. DSPlayer über Slugs
-        val slugs = mutableSetOf<String>()
-        val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
-        if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
-        mainCandidates.forEach { u ->
-            Regex("""[?&](?:search|v|slug|film)=([^&"'\s<>\\]+)""").findAll(u).forEach {
-                slugs.add(it.groupValues[1].removeSuffix(".mp4").trim())
-            }
-        }
-        for (slug in slugs) {
-            val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
-            for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
-                for (dsUrl in listOf(
-                    "https://dsplayer.site/watch.php?v=$s.mp4",
-                    "https://dsplayer.site/watch.php?v=$s",
-                    "https://dsplayer.site/embed2/video.php?slug=$s",
-                    "https://dsplayer.site/video.php?slug=$s"
-                )) {
-                    if (!visited.add(dsUrl)) continue
-                    try {
-                        val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
-                        directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-
-        // 2. Server-Tab-Varianten
-        val playerPages = linkedSetOf<String>()
-        mainCandidates.forEach { u ->
-            if (isOwnSite(u) && (u.contains("/embed/") || u.contains("/exyuvid/") || u.contains(".php"))) playerPages.add(u)
-        }
-        playerPages.toList().forEach { u ->
-            if (u.contains(Regex("""sro\d*\.php"""))) {
-                for (n in 1..8) playerPages.add(u.replace(Regex("""sro\d*\.php"""), "sro$n.php"))
-            }
-            if (u.contains("srofilm.php")) {
-                for (n in 1..5) {
-                    playerPages.add(u.replace("srofilm.php", "srofilm$n.php"))
-                    playerPages.add(u.replace("srofilm.php", "sro$n.php"))
-                }
-            }
-        }
-
-        // 3. Externe Hoster auf der Hauptseite
-        mainCandidates.filterNot { isOwnSite(it) || it.contains("dsplayer") }
-            .sortedByDescending { priority(it) }.take(14)
-            .forEach {
-                tryHoster(it, data, "$name - ${urlBase(it).substringAfter("//")}", visited, emitted, subtitleCallback, wrapped)
-            }
-
-        // 4. Interne Player-Seiten
-        var budget = 28
-        for (pUrl in playerPages) {
-            if (budget <= 0) break
-            if (!visited.add(pUrl)) continue
-            budget--
-            try {
-                val resp = app.get(pUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
-                val finalUrl = resp.url
-                val label = "$name - " + pUrl.substringAfterLast("/").substringBefore(".php").uppercase()
-
-                if (finalUrl.isNotEmpty() && finalUrl != pUrl && !isOwnSite(finalUrl)) {
-                    tryHoster(finalUrl, data, label, visited, emitted, subtitleCallback, wrapped)
-                    continue
-                }
-
-                val subHtml = resp.text
-                val subDoc = resp.document
-                val subCands = collectCandidates(subDoc, subHtml)
-
-                directVideos(subDoc, subHtml, pUrl, label, emitted, wrapped)
-
-                subCands.filterNot { isOwnSite(it) }
-                    .sortedByDescending { priority(it) }.take(14)
-                    .forEach { u ->
-                        if (u.contains("dsplayer")) {
-                            if (visited.add(u)) {
-                                try {
-                                    val r = app.get(u, headers = mapOf("User-Agent" to userAgent, "Referer" to pUrl))
-                                    directVideos(r.document, r.text, u, "$name - DSServer", emitted, wrapped)
-                                } catch (_: Exception) {}
-                            }
-                        } else {
-                            tryHoster(u, pUrl, "$name - ${urlBase(u).substringAfter("//")}", visited, emitted, subtitleCallback, wrapped)
-                        }
+        // Player-Frames (sro*.php) holen und deren Switch auslesen
+        val mainCands = collectCandidates(page.document, page.text)
+        mainCands.filter { isOwnSite(it) && it != data && (it.contains(".php") || it.contains("/embed")) }
+            .take(6)
+            .forEach { p ->
+                if (!visited.add(p)) return@forEach
+                try {
+                    val r = app.get(p, headers = mapOf("User-Agent" to userAgent, "Referer" to data))
+                    val found = extractServerUrls(r.text)
+                    dbg("FRAME $p -> ${found.size} Server")
+                    serverUrls.addAll(found)
+                    if (found.isEmpty()) {
+                        serverUrls.addAll(collectCandidates(r.document, r.text).filterNot { isOwnSite(it) })
                     }
+                } catch (_: Exception) {}
+            }
 
-                subCands.filter { isOwnSite(it) && it != pUrl && (it.contains(".php") || it.contains("/embed")) }
-                    .take(4).forEach loop@{ innerUrl ->
-                        if (!visited.add(innerUrl)) return@loop
+        dbg("SERVERLISTE (${serverUrls.size}):")
+        serverUrls.forEach { dbg("  -> $it") }
+
+        // Alle Server verarbeiten
+        serverUrls.forEach { u ->
+            handleServer(u, data, "$name - ${urlBase(u).substringAfter("//").substringBefore(".")}", visited, emitted, subtitleCallback, wrapped)
+        }
+
+        // Fallback: DSPlayer-Slugs, falls bisher nichts gefunden
+        if (!foundAny && emitted.isEmpty()) {
+            val pathSlug = data.removeSuffix("/").substringAfterLast("/").substringBefore(".").substringBefore("?")
+            val slugs = mutableSetOf<String>()
+            if (pathSlug.isNotEmpty() && pathSlug != "film" && pathSlug != "serija") slugs.add(pathSlug)
+            serverUrls.forEach { u ->
+                Regex("""[?&](?:search|v|slug|film)=([^&"'\s<>\\]+)""").findAll(u).forEach {
+                    slugs.add(it.groupValues[1].removeSuffix(".mp4").trim())
+                }
+            }
+            for (slug in slugs) {
+                val cleanSlug = slug.removePrefix("rs-").removePrefix("glo-")
+                for (s in listOf(cleanSlug, "rs-$cleanSlug", "glo-$cleanSlug").distinct()) {
+                    for (dsUrl in listOf(
+                        "https://dsplayer.site/watch.php?v=$s.mp4",
+                        "https://dsplayer.site/watch.php?v=$s",
+                        "https://dsplayer.site/embed2/video.php?slug=$s"
+                    )) {
+                        if (!visited.add(dsUrl)) continue
                         try {
-                            val r2 = app.get(innerUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to pUrl))
-                            if (!isOwnSite(r2.url) && r2.url != innerUrl) {
-                                tryHoster(r2.url, pUrl, label, visited, emitted, subtitleCallback, wrapped)
-                            } else {
-                                collectCandidates(r2.document, r2.text).filterNot { isOwnSite(it) }
-                                    .sortedByDescending { priority(it) }.take(8)
-                                    .forEach {
-                                        tryHoster(it, innerUrl, label, visited, emitted, subtitleCallback, wrapped)
-                                    }
-                                directVideos(r2.document, r2.text, innerUrl, label, emitted, wrapped)
-                            }
+                            val r = app.get(dsUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "$mainUrl/"))
+                            directVideos(r.document, r.text, dsUrl, "$name - DSServer", emitted, wrapped)
                         } catch (_: Exception) {}
                     }
-            } catch (_: Exception) {}
+                }
+            }
         }
 
+        dbg("=== ENDE: foundAny=$foundAny emitted=${emitted.size} ===")
         return foundAny || emitted.isNotEmpty()
     }
 }
