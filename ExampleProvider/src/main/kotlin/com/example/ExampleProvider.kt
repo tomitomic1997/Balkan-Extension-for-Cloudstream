@@ -8,7 +8,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-class ExYuTeka : MainAPI() {
+class ExYouTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
     override var name = "ExYouTeka"
     override val hasMainPage = true
@@ -377,6 +377,30 @@ class ExYuTeka : MainAPI() {
         return found
     }
 
+    // Funktion zum Normalisieren von Embed-URLs
+    private fun normalizeEmbedUrl(url: String): String? {
+        val u = url.trim()
+        return when {
+            // Filemoon: https://filemoon.to/xyz -> https://filemoon.to/e/xyz
+            u.contains("filemoon") && !u.contains("/e/") && !u.contains("/embed/") -> {
+                u.replace(Regex("""(https?://[^/]+)/([a-zA-Z0-9_-]+)$"""), "$1/e/$2")
+            }
+            // Voe: https://voe.sx/xyz -> https://voe.sx/e/xyz
+            u.contains("voe") && !u.contains("/e/") && !u.contains("/embed/") -> {
+                u.replace(Regex("""(https?://[^/]+)/([a-zA-Z0-9_-]+)$"""), "$1/e/$2")
+            }
+            // Streamtape: https://streamtape.com/xyz -> https://streamtape.com/e/xyz
+            u.contains("streamtape") && !u.contains("/e/") && !u.contains("/v/") -> {
+                u.replace(Regex("""(https?://[^/]+)/([a-zA-Z0-9_-]+)$"""), "$1/e/$2")
+            }
+            // Doodstream: https://dood.watch/xyz -> https://dood.watch/e/xyz
+            u.contains("dood") && !u.contains("/e/") && !u.contains("/embed/") -> {
+                u.replace(Regex("""(https?://[^/]+)/([a-zA-Z0-9_-]+)$"""), "$1/e/$2")
+            }
+            else -> u
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -468,13 +492,13 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // Regex-Muster für Embed-URLs bekannter Hoster
+        // Regex-Muster für Embed-URLs bekannter Hoster (breiter gefasst)
         val hosterPatterns = listOf(
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)""")
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)""")
         )
 
         // 2. Server-Tabs durchsuchen
@@ -491,13 +515,14 @@ class ExYuTeka : MainAPI() {
                     sroHtml
                 }
 
-                // Hoster-URLs per Regex finden
+                // Hoster-URLs per Regex finden und normalisieren
                 for (pattern in hosterPatterns) {
                     for (match in pattern.findAll(unpackedHtml)) {
-                        val url = match.groupValues[1]
-                        if (visitedUrls.add(url)) {
+                        val rawUrl = match.groupValues[1]
+                        val normalizedUrl = normalizeEmbedUrl(rawUrl)
+                        if (normalizedUrl != null && visitedUrls.add(normalizedUrl)) {
                             try {
-                                loadExtractor(url, data, subtitleCallback, wrappedCallback)
+                                loadExtractor(normalizedUrl, data, subtitleCallback, wrappedCallback)
                             } catch (_: Exception) {}
                         }
                     }
@@ -541,9 +566,10 @@ class ExYuTeka : MainAPI() {
                         }
                     }
 
-                    if (candUrl.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(candUrl)) {
+                    val normalizedCandUrl = normalizeEmbedUrl(candUrl)
+                    if (normalizedCandUrl != null && normalizedCandUrl.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(normalizedCandUrl)) {
                         try {
-                            loadExtractor(candUrl, data, subtitleCallback, wrappedCallback)
+                            loadExtractor(normalizedCandUrl, data, subtitleCallback, wrappedCallback)
                         } catch (_: Exception) {}
                     }
                 }
@@ -552,9 +578,10 @@ class ExYuTeka : MainAPI() {
 
         // 3. Direkte Hoster-Links auf der Hauptseite
         for (u in embedUrls) {
-            if (u.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(u)) {
+            val normalizedU = normalizeEmbedUrl(u)
+            if (normalizedU != null && normalizedU.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(normalizedU)) {
                 try {
-                    loadExtractor(u, data, subtitleCallback, wrappedCallback)
+                    loadExtractor(normalizedU, data, subtitleCallback, wrappedCallback)
                 } catch (_: Exception) {}
             }
         }
