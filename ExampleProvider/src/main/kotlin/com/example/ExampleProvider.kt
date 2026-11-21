@@ -152,7 +152,7 @@ class ExYuTeka : MainAPI() {
         return emptyList()
     }
 
-    // ------------------------------------------------------------------ Details
+    // ------------------------------------------------------------------ Details / Episoden
 
     override suspend fun load(url: String): LoadResponse {
         var targetUrl = url
@@ -394,13 +394,17 @@ class ExYuTeka : MainAPI() {
         if (code.length < 4) return false
 
         try {
+            // WICHTIG: Wir geben vor, dass die Anfrage von ExYuTeka kommt!
+            val apiHeaders = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to "https://exyuteka.net/",
+                "Origin" to "https://exyuteka.net",
+                "Accept" to "application/json, text/plain, */*"
+            )
+
             val detailsText = app.get(
                 "$base/api/videos/$code/embed/details",
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to "$base/",
-                    "Accept" to "application/json, text/plain, */*"
-                )
+                headers = apiHeaders
             ).text.replace("\\/", "/")
 
             val frameUrl = Regex(""""embed_frame_url"\s*:\s*"([^"]+)"""")
@@ -409,14 +413,16 @@ class ExYuTeka : MainAPI() {
             val embedBase = urlBase(frameUrl)
             val embedCode = urlCode(frameUrl)
 
+            // Auch der Playback-Request braucht den korrekten Referer
             val pbText = app.get(
                 "$embedBase/api/videos/$embedCode/embed/playback",
                 headers = mapOf(
                     "User-Agent" to userAgent,
-                    "accept" to "*/*",
-                    "accept-language" to "en-US,en;q=0.5",
-                    "referer" to frameUrl,
-                    "x-embed-parent" to embedUrl
+                    "Accept" to "*/*",
+                    "Accept-Language" to "en-US,en;q=0.5",
+                    "Referer" to "https://exyuteka.net/",
+                    "Origin" to "https://exyuteka.net",
+                    "X-Embed-Parent" to "https://exyuteka.net/"
                 )
             ).text
 
@@ -442,6 +448,7 @@ class ExYuTeka : MainAPI() {
                 val u = Regex(""""url"\s*:\s*"([^"]+)"""").find(obj)?.groupValues?.get(1) ?: return@forEach
                 if (!u.startsWith("http")) return@forEach
                 if (!emitted.add(u)) return@forEach
+
                 val h = Regex(""""height"\s*:\s*(\d+)""").find(obj)?.groupValues?.get(1)?.toIntOrNull()
                 val lbl = Regex(""""label"\s*:\s*"([^"]+)"""").find(obj)?.groupValues?.get(1)
                 val isM3u8 = u.contains(".m3u8") || obj.contains("mpegurl", true) || obj.contains("hls", true)
@@ -452,9 +459,9 @@ class ExYuTeka : MainAPI() {
                     url = u,
                     type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = "$embedBase/"
+                    this.referer = "https://exyuteka.net/"
                     this.quality = h ?: Qualities.P1080.value
-                    this.headers = mapOf("Referer" to "$embedBase/", "User-Agent" to userAgent)
+                    this.headers = mapOf("Referer" to "https://exyuteka.net/", "User-Agent" to userAgent)
                 })
                 found = true
             }
