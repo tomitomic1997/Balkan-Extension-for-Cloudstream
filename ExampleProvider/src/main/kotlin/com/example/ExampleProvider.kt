@@ -387,7 +387,6 @@ class ExYuTeka : MainAPI() {
         val visitedUrls = mutableSetOf<String>()
         var foundAny = false
 
-        // Wrapper, um foundAny auf true zu setzen, sobald ein Stream gefunden wird
         val wrappedCallback: (ExtractorLink) -> Unit = { link ->
             foundAny = true
             callback(link)
@@ -396,17 +395,18 @@ class ExYuTeka : MainAPI() {
         val document = app.get(data, headers = headers).document
         val embedUrls = mutableSetOf<String>()
 
-        document.select("iframe").forEach {
-            val src = it.attr("src").ifEmpty { it.attr("data-src") }
-            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
+        // Server-Tabs und Buttons durchsuchen
+        document.select(".server-tab, .server-btn, [data-url], [data-src], [data-embed], .server-option").forEach { el ->
+            val src = el.attr("data-url").ifEmpty { el.attr("data-src").ifEmpty { el.attr("data-embed") } }
+            if (src.isNotEmpty()) {
                 embedUrls.add(fixUrl(src))
             }
         }
 
-        document.select("[data-src], [data-url], [data-embed]").forEach { elem ->
-            val u = elem.attr("data-src").ifEmpty { elem.attr("data-url").ifEmpty { elem.attr("data-embed") } }
-            if (u.contains("embed") || u.contains("php") || u.contains("dsplayer") || u.contains("streamtape") || u.contains("filemoon") || u.contains("voe")) {
-                embedUrls.add(fixUrl(u))
+        document.select("iframe").forEach {
+            val src = it.attr("src").ifEmpty { it.attr("data-src") }
+            if (src.isNotEmpty() && !src.contains("googletag") && !src.contains("managertechnically")) {
+                embedUrls.add(fixUrl(src))
             }
         }
 
@@ -468,16 +468,16 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        // Regex-Muster für alle bekannten Hoster (Filemoon, Voe, Streamtape, Doodstream, etc.)
+        // Regex-Muster für Embed-URLs bekannter Hoster
         val hosterPatterns = listOf(
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)""")
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/(?:e|embed)/[a-zA-Z0-9_-]+)""")
         )
 
-        // 2. Server-Tabs durchsuchen (DSServer, StreamTape, Filemoon, Voe etc.)
+        // 2. Server-Tabs durchsuchen
         for (sUrl in serverUrls) {
             if (!visitedUrls.add(sUrl)) continue
             try {
@@ -485,20 +485,19 @@ class ExYuTeka : MainAPI() {
                 val sroDoc = sroResponse.document
                 val sroHtml = sroResponse.text
 
-                // JS Entpacker für verschlüsselte Embed-URLs
                 val unpackedHtml = if (sroHtml.contains("eval(function(p,a,c,k,e,")) {
                     try { getAndUnpack(sroHtml) } catch (_: Exception) { sroHtml }
                 } else {
                     sroHtml
                 }
 
-                // Hoster-URLs per Regex im entpackten HTML finden
+                // Hoster-URLs per Regex finden
                 for (pattern in hosterPatterns) {
                     for (match in pattern.findAll(unpackedHtml)) {
                         val url = match.groupValues[1]
                         if (visitedUrls.add(url)) {
                             try {
-                                loadExtractor(url, sUrl, subtitleCallback, wrappedCallback)
+                                loadExtractor(url, data, subtitleCallback, wrappedCallback)
                             } catch (_: Exception) {}
                         }
                     }
@@ -542,10 +541,9 @@ class ExYuTeka : MainAPI() {
                         }
                     }
 
-                    // Zusätzlicher Fallback für bekannte Hoster über loadExtractor
                     if (candUrl.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(candUrl)) {
                         try {
-                            loadExtractor(candUrl, sUrl, subtitleCallback, wrappedCallback)
+                            loadExtractor(candUrl, data, subtitleCallback, wrappedCallback)
                         } catch (_: Exception) {}
                     }
                 }
