@@ -10,7 +10,7 @@ import java.net.URLEncoder
 
 class ExYuTeka : MainAPI() {
     override var mainUrl = "https://exyuteka.net"
-    override var name = "ExYuTeka"
+    override var name = "ExYouTeka"
     override val hasMainPage = true
     override var lang = "un"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
@@ -189,7 +189,7 @@ class ExYuTeka : MainAPI() {
             }
         }
 
-        val title = document.selectFirst(".single-title, h1, .title")?.text()?.trim() ?: "ExYuTeka"
+        val title = document.selectFirst(".single-title, h1, .title")?.text()?.trim() ?: "ExYouTeka"
         val posterImg = document.selectFirst(".single-poster img, .poster img, img[src*='/slika'], .movie-poster img, .entry-poster img")
         val posterUrl = fixUrlNull(
             posterImg?.attr("data-src")?.ifEmpty { null }
@@ -385,6 +385,13 @@ class ExYuTeka : MainAPI() {
     ): Boolean {
         val emittedStreams = mutableSetOf<String>()
         val visitedUrls = mutableSetOf<String>()
+        var foundAny = false
+
+        // Wrapper, um foundAny auf true zu setzen, sobald ein Stream gefunden wird
+        val wrappedCallback: (ExtractorLink) -> Unit = { link ->
+            foundAny = true
+            callback(link)
+        }
 
         val document = app.get(data, headers = headers).document
         val embedUrls = mutableSetOf<String>()
@@ -452,7 +459,7 @@ class ExYuTeka : MainAPI() {
                 )
                 for (dsUrl in dsplayerVariants) {
                     if (visitedUrls.add(dsUrl)) {
-                        if (parseDsPlayer(dsUrl, emittedStreams, callback)) {
+                        if (parseDsPlayer(dsUrl, emittedStreams, wrappedCallback)) {
                             dsFound = true
                             break
                         }
@@ -463,11 +470,11 @@ class ExYuTeka : MainAPI() {
 
         // Regex-Muster für alle bekannten Hoster (Filemoon, Voe, Streamtape, Doodstream, etc.)
         val hosterPatterns = listOf(
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/[ve]/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/[ve]/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/[ve]/[a-zA-Z0-9_-]+)"""),
-            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/[a-zA-Z0-9_-/]+)""")
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:filemoon|moonplayer)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*voe[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:dood|d0000d|ds2play)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*streamtape[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)"""),
+            Regex("""(https?://[a-zA-Z0-9.-]*(?:mixdrop|upstream|streamhide|vidlox|wolfstream|supervideo)[a-zA-Z0-9.-]*/[a-zA-Z0-9_/-]+)""")
         )
 
         // 2. Server-Tabs durchsuchen (DSServer, StreamTape, Filemoon, Voe etc.)
@@ -491,7 +498,7 @@ class ExYuTeka : MainAPI() {
                         val url = match.groupValues[1]
                         if (visitedUrls.add(url)) {
                             try {
-                                loadExtractor(url, sUrl, subtitleCallback, callback)
+                                loadExtractor(url, sUrl, subtitleCallback, wrappedCallback)
                             } catch (_: Exception) {}
                         }
                     }
@@ -530,7 +537,7 @@ class ExYuTeka : MainAPI() {
                     ) continue
 
                     if (!dsFound && candUrl.contains("dsplayer.site") && visitedUrls.add(candUrl)) {
-                        if (parseDsPlayer(candUrl, emittedStreams, callback)) {
+                        if (parseDsPlayer(candUrl, emittedStreams, wrappedCallback)) {
                             dsFound = true
                         }
                     }
@@ -538,7 +545,7 @@ class ExYuTeka : MainAPI() {
                     // Zusätzlicher Fallback für bekannte Hoster über loadExtractor
                     if (candUrl.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(candUrl)) {
                         try {
-                            loadExtractor(candUrl, sUrl, subtitleCallback, callback)
+                            loadExtractor(candUrl, sUrl, subtitleCallback, wrappedCallback)
                         } catch (_: Exception) {}
                     }
                 }
@@ -549,11 +556,11 @@ class ExYuTeka : MainAPI() {
         for (u in embedUrls) {
             if (u.contains(Regex("""(?:filemoon|voe|streamtape|dood|mixdrop|upstream)""")) && visitedUrls.add(u)) {
                 try {
-                    loadExtractor(u, data, subtitleCallback, callback)
+                    loadExtractor(u, data, subtitleCallback, wrappedCallback)
                 } catch (_: Exception) {}
             }
         }
 
-        return emittedStreams.isNotEmpty()
+        return foundAny
     }
 }
